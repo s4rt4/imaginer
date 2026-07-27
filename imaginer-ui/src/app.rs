@@ -6,6 +6,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use eframe::egui;
 use imaginer_core::Stage;
 
+use crate::logo;
 use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
 use crate::theme;
@@ -26,6 +27,9 @@ pub struct App {
     /// Bumped per load so each texture gets a distinct name in egui's texture manager.
     texture_generation: u64,
     last_zoom: f32,
+    /// Uploaded the first time the empty state is drawn, so launching with an image
+    /// never pays for it.
+    logotype: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -55,6 +59,7 @@ impl App {
             view: viewer::ViewState::default(),
             texture_generation: 0,
             last_zoom: 1.0,
+            logotype: None,
         }
     }
 
@@ -211,12 +216,16 @@ impl eframe::App for App {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::CANVAS_BG))
-            .show(ui, |ui| match self.texture.as_ref() {
-                Some(texture) => {
+            .show(ui, |ui| {
+                if let Some(texture) = self.texture.as_ref() {
                     self.last_zoom = viewer::show(ui, texture, &mut self.view);
                     self.trace.mark_first_image();
+                } else {
+                    let logotype = self
+                        .logotype
+                        .get_or_insert_with(|| logo::logotype_texture(ui.ctx()));
+                    empty_state(ui, logotype, self.error.as_deref());
                 }
-                None => empty_state(ui, self.error.as_deref()),
             });
 
         if open_requested {
@@ -234,13 +243,37 @@ impl eframe::App for App {
     }
 }
 
-fn empty_state(ui: &mut egui::Ui, error: Option<&str>) {
-    ui.centered_and_justified(|ui| match error {
-        Some(error) => {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-        }
-        None => {
-            ui.colored_label(theme::TEXT_MUTED, "Drop an image here");
+/// Drawn width of the wordmark. Present but quiet — this screen exists to be left,
+/// so the logo should identify the app without turning into a splash screen.
+const LOGOTYPE_DRAW_WIDTH: f32 = 210.0;
+
+/// Gap between the wordmark and the line below it.
+const LOGOTYPE_GAP: f32 = 22.0;
+
+fn empty_state(ui: &mut egui::Ui, logotype: &egui::TextureHandle, error: Option<&str>) {
+    let native = logotype.size_vec2();
+    let drawn = egui::vec2(
+        LOGOTYPE_DRAW_WIDTH,
+        LOGOTYPE_DRAW_WIDTH * native.y / native.x,
+    );
+
+    ui.vertical_centered(|ui| {
+        // Centre the block as a whole. `centered_and_justified` only centres a single
+        // widget, and letting the layout stack from the top would leave the pair
+        // clinging to the ceiling of a tall window.
+        let block_height = drawn.y + LOGOTYPE_GAP + ui.text_style_height(&egui::TextStyle::Body);
+        ui.add_space(((ui.available_height() - block_height) * 0.5).max(0.0));
+
+        ui.add(egui::Image::new(logotype).fit_to_exact_size(drawn));
+        ui.add_space(LOGOTYPE_GAP);
+
+        match error {
+            Some(error) => {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            None => {
+                ui.colored_label(theme::TEXT_MUTED, "Drop an image here");
+            }
         }
     });
 }

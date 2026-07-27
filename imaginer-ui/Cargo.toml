@@ -23,6 +23,12 @@ eframe = { version = "0.35.0", default-features = false, features = ["glow"] }
 # predictable branch on an atomic — nothing that shows up in startup.
 log = "0.4"
 
+[build-dependencies]
+# Rasterises the logo SVGs at build time so the shipping binary carries pixels, not
+# an SVG renderer. `text` is off because the artwork is all paths -- that drops
+# fontdb and its font enumeration from the build entirely.
+resvg = { version = "0.47", default-features = false }
+
 [features]
 default = []
 # Compiles the wgpu backend alongside glow so `IMAGINER_RENDERER=wgpu` can be

@@ -51,6 +51,12 @@ The binary prints milestones to stderr under `IMAGINER_TRACE_STARTUP=1`, and
 `IMAGINER_EXIT_AFTER_FIRST_FRAME=1` makes it close as soon as there is something
 to measure.
 
+**Only compare runs taken minutes apart.** These numbers drift with machine state —
+a session of back-to-back LTO builds moved `first_image` by ~150ms with no code
+change at all, which is larger than most changes worth measuring. A number from
+yesterday is not a baseline. To judge a change, measure it and its alternative in
+the same sitting; the numbers below are shape, not constants.
+
 ### Where the time actually goes
 
 Measured on the development machine (Ryzen laptop, hybrid AMD iGPU + RTX 3050),

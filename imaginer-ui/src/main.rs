@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod logo;
 mod startup;
 mod texture;
 mod theme;
@@ -46,10 +47,13 @@ fn main() -> eframe::Result {
     startup::install_init_logger(launched_at);
 
     let options = eframe::NativeOptions {
+        // The icon was A/B'd against no icon at all: ~20ms apart over 15 runs each,
+        // inside the run-to-run spread. It is free.
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([420.0, 300.0])
             .with_title("Imaginer")
+            .with_icon(logo::window_icon())
             .with_drag_and_drop(true),
         renderer: renderer_choice(),
         glow_options: eframe::egui_glow::GlowConfiguration {
