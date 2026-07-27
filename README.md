@@ -99,8 +99,11 @@ startup ~300ms worse. Re-run with `.\scripts\bench-gpu-preference.ps1`.
 worse. **~900ms is the floor for eframe + glow on this machine.**
 
 The one measurable win left is vsync: `IMAGINER_VSYNC=0` takes `first_image` from
-~1152ms to ~974ms. It is still on by default, because turning it off can tear
-while panning and zooming and that tradeoff has not been eyeballed yet.
+~1152ms to ~974ms. It stays on anyway. The app already starts faster than nomacs
+with vsync on, so the saving buys nothing; tearing while panning and zooming would
+be paid every session where the 180ms is paid once; and vsync is what caps the
+repaint loop that runs during decode, which would otherwise spin at unbounded FPS.
+The env var is kept for re-measuring, not for shipping with it off.
 
 ### Is it actually fast?
 
@@ -112,11 +115,12 @@ yardstick is nomacs, on the same machine and image, warm:
 | Imaginer | ~335ms |
 | nomacs | ~1303ms |
 
-Imaginer's window appears at ~335ms but is empty until ~1152ms, so the fair
-comparison is ~1152ms against nomacs' ~1303ms-plus-paint. The project's premise
-holds — it does start faster — but by a modest margin rather than an order of
-magnitude. Compare with `.\scripts\bench-vs-viewer.ps1`; that metric is
-approximate, see the script header.
+Imaginer's window appears at ~335ms but is empty until ~1152ms, so the honest
+comparison is ~1152ms against nomacs. nomacs cannot have painted the image before
+it has a window, so its time-to-image is necessarily above ~1303ms: Imaginer wins
+by at least ~150ms, with vsync on. The project's premise holds — it does start
+faster — but by a modest margin rather than an order of magnitude. Compare with
+`.\scripts\bench-vs-viewer.ps1`; that metric is approximate, see the script header.
 
 Renderer comparison on the same machine (`first_image`, median of 10):
 
