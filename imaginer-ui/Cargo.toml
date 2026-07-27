@@ -1,0 +1,25 @@
+[package]
+name = "imaginer-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "imaginer"
+path = "src/main.rs"
+
+[dependencies]
+imaginer-core = { path = "../imaginer-core" }
+
+# `default-features = false` matters for startup: the default set pulls in
+# `default_fonts` (Ubuntu + Hack + an emoji font, ~1-2MB) whose atlas is built
+# during init. We load one system font instead.
+eframe = { version = "0.35.0", default-features = false, features = ["glow"] }
+
+[features]
+default = []
+# Compiles the wgpu backend alongside glow so `IMAGINER_RENDERER=wgpu` can be
+# measured against it on new hardware. Off by default because it roughly doubles
+# build time, and glow won by 2.6x on the machine this was developed on.
+compare-renderers = ["eframe/wgpu"]

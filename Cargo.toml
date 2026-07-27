@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["imaginer-core", "imaginer-ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+
+# Startup time is the whole point of this project, so the release profile is tuned
+# for it: fat LTO + a single codegen unit shrink the binary (less cold disk read),
+# and `panic = "abort"` drops the unwinding tables.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Decoding a 24MP JPEG under a debug build is unusably slow, so optimize
+# dependencies even in dev.
+[profile.dev.package."*"]
+opt-level = 3

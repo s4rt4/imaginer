@@ -1,0 +1,22 @@
+[package]
+name = "imaginer-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# This crate must never gain a UI dependency. Decode, cache and edit logic live
+# here so they stay testable without spinning up a window.
+[dependencies]
+# Only the Phase 1 formats. `image`'s default feature set drags in AVIF encoding
+# (ravif), OpenEXR, TIFF and more — a large build-time and binary-size cost for
+# formats we do not ship yet. Add features here as phases land.
+image = { version = "0.25.10", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "webp",
+] }
+kamadak-exif = "0.6.1"
+thiserror = "2.0.19"
