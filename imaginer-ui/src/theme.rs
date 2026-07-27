@@ -101,7 +101,13 @@ fn install_visuals(ctx: &egui::Context) {
         w.corner_radius = CornerRadius::same(5);
     }
 
-    ctx.set_visuals(visuals);
+    // Pin the theme rather than using `set_visuals`, which writes into whichever
+    // theme is currently active. At `App::new` time egui has not yet learned the
+    // system preference, so on a light-mode machine these visuals landed in the
+    // dark slot and were then discarded when the first frame switched to light.
+    // A photo viewer wants dark chrome regardless of the system setting anyway.
+    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.set_visuals_of(egui::Theme::Dark, visuals);
 
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
