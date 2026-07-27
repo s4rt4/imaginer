@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" width="512" height="512" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="New_Gradient_Swatch_2" data-name="New Gradient Swatch 2" cx="256" cy="256" fx="256" fy="256" r="247.3" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#d84769"/>
+      <stop offset="1" stop-color="#dc233d"/>
+    </radialGradient>
+  </defs>
+  <circle cx="256" cy="256" r="247.3" fill="url(#New_Gradient_Swatch_2)"/>
+  <g>
+    <path d="M254.97,243.44s-47.69-36.16-54.62-92.7c-6.92-56.54,69.23-75,90-107.31,0,0,78.47,78.47,41.54,125.78-36.92,47.31-75.39,35.39-76.93,74.23Z" fill="#f4cf48"/>
+    <path d="M268.56,254.97s36.16-47.69,92.7-54.62c56.54-6.92,75,69.23,107.31,90,0,0-78.47,78.47-125.78,41.54-47.31-36.92-35.39-75.39-74.23-76.93Z" fill="#f4cf48"/>
+    <path d="M257.03,268.56s47.69,36.16,54.62,92.7c6.92,56.54-69.23,75-90,107.31,0,0-78.47-78.47-41.54-125.78,36.92-47.31,75.39-35.39,76.93-74.23Z" fill="#f4cf48"/>
+    <path d="M243.44,257.03s-36.16,47.69-92.7,54.62c-56.54,6.92-75-69.23-107.31-90,0,0,78.47-78.47,125.78-41.54,47.31,36.92,35.39,75.39,74.23,76.93Z" fill="#f4cf48"/>
+  </g>
+</svg>

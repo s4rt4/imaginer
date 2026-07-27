@@ -17,6 +17,12 @@ imaginer-core = { path = "../imaginer-core" }
 # during init. We load one system font instead.
 eframe = { version = "0.35.0", default-features = false, features = ["glow"] }
 
+# Only so `IMAGINER_TRACE_INIT` can capture eframe's own debug logging, which is the
+# one window into the setup phases we cannot instrument ourselves. Already in the
+# dependency graph via eframe, and without a logger installed a `log` call is a
+# predictable branch on an atomic — nothing that shows up in startup.
+log = "0.4"
+
 [features]
 default = []
 # Compiles the wgpu backend alongside glow so `IMAGINER_RENDERER=wgpu` can be

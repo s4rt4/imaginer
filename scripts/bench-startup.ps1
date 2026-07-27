@@ -50,11 +50,17 @@ $env:IMAGINER_EXIT_AFTER_FIRST_FRAME = "1"
 
 # Milestone name -> samples. Ordered so the report reads chronologically.
 $milestones = [ordered]@{
-    'context_ready' = [System.Collections.Generic.List[double]]::new()
-    'theme_ready'   = [System.Collections.Generic.List[double]]::new()
-    'first_image'   = [System.Collections.Generic.List[double]]::new()
-    'first_frame'   = [System.Collections.Generic.List[double]]::new()
+    'decode_spawned' = [System.Collections.Generic.List[double]]::new()
+    'run_native'     = [System.Collections.Generic.List[double]]::new()
+    'context_ready'  = [System.Collections.Generic.List[double]]::new()
+    'theme_ready'    = [System.Collections.Generic.List[double]]::new()
+    'first_image'    = [System.Collections.Generic.List[double]]::new()
+    'first_frame'    = [System.Collections.Generic.List[double]]::new()
 }
+
+# Which GPU the GL context bound to. Constant across runs, so one sample is enough --
+# but it is the fact that explains the context_ready number, so it gets reported.
+$script:glInfo = $null
 
 # Milestones go to stderr, which cannot be captured with `2>&1` here: in Windows
 # PowerShell that wraps every line in an ErrorRecord and reports failure even when
@@ -70,7 +76,10 @@ function Invoke-Run {
     if (-not $Record) { return }
 
     foreach ($line in (Get-Content $errFile)) {
-        if ($line -match 'startup:\s+(\w+)\s+([\d.]+)ms') {
+        if ($line -match 'startup:\s+gl\s+(.+)$') {
+            $script:glInfo = $matches[1]
+        }
+        elseif ($line -match 'startup:\s+(\w+)\s+([\d.]+)ms') {
             $name = $matches[1]
             if ($milestones.Contains($name)) {
                 $milestones[$name].Add([double]$matches[2])
@@ -114,6 +123,9 @@ function Get-Stats {
 
 Write-Host ""
 Write-Host "Warm start, $(Split-Path -Leaf $Image)" -ForegroundColor Green
+if ($script:glInfo) {
+    Write-Host ("{0,-15} {1}" -f 'gl', $script:glInfo) -ForegroundColor DarkCyan
+}
 foreach ($name in $milestones.Keys) {
     Get-Stats -Values $milestones[$name] -Label $name
 }

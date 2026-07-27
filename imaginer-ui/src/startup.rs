@@ -9,6 +9,10 @@
 //!   * `IMAGINER_TRACE_STARTUP=1` — print milestones to stderr as `startup: <ms>`
 //!   * `IMAGINER_EXIT_AFTER_FIRST_FRAME=1` — close as soon as the first frame is
 //!     painted, so a benchmark loop can measure without a human closing windows
+//!   * `IMAGINER_TRACE_INIT=1` — additionally timestamp eframe's own debug logging,
+//!     which is the only visibility into the phases between `run_native` and
+//!     `context_ready`. Noisy, and the printing itself perturbs the numbers a
+//!     little, so it is for investigation rather than routine benchmarking.
 
 use std::time::Instant;
 
@@ -41,6 +45,34 @@ impl StartupTrace {
         self.report(milestone);
     }
 
+    /// Report which GPU the GL context actually bound to.
+    ///
+    /// On a hybrid-GPU laptop this is the single most important fact about startup:
+    /// binding the discrete adapter means loading the vendor's OpenGL ICD, which is
+    /// where the bulk of the launch time is suspected to go. Without this line the
+    /// timings cannot be attributed to an adapter at all.
+    pub fn report_gl(&self, gl: Option<&eframe::glow::Context>) {
+        if !self.trace_enabled {
+            return;
+        }
+        let Some(gl) = gl else {
+            eprintln!("startup: gl <no glow context — not the glow backend>");
+            return;
+        };
+
+        use eframe::glow::HasContext as _;
+        // SAFETY: called on the thread that owns the current GL context, from
+        // `App::new`, which eframe runs after making the context current.
+        let (vendor, renderer, version) = unsafe {
+            (
+                gl.get_parameter_string(eframe::glow::VENDOR),
+                gl.get_parameter_string(eframe::glow::RENDERER),
+                gl.get_parameter_string(eframe::glow::VERSION),
+            )
+        };
+        eprintln!("startup: gl vendor={vendor} | renderer={renderer} | version={version}");
+    }
+
     pub fn elapsed_ms(&self) -> f64 {
         self.launched_at.elapsed().as_secs_f64() * 1000.0
     }
@@ -71,4 +103,48 @@ impl StartupTrace {
 
 fn flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| v != "0" && !v.is_empty())
+}
+
+/// Route eframe's `log` output into the startup trace, stamped from the same clock.
+///
+/// The gap between `run_native` and `context_ready` is all third-party code — winit,
+/// glutin, the GPU driver — with no place to hang a milestone of our own. eframe
+/// already logs around each phase of that setup; timestamping those lines turns one
+/// opaque number into a breakdown, without a profiler or a probe binary.
+///
+/// Call before `run_native`. Does nothing unless `IMAGINER_TRACE_INIT` is set.
+pub fn install_init_logger(launched_at: Instant) {
+    if !flag("IMAGINER_TRACE_INIT") {
+        return;
+    }
+
+    struct TraceLogger {
+        launched_at: Instant,
+    }
+
+    impl log::Log for TraceLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Debug
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let ms = self.launched_at.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "startup: log {ms:.1}ms [{}] {}",
+                record.target(),
+                record.args()
+            );
+        }
+
+        fn flush(&self) {}
+    }
+
+    // Leaks the logger, which is what the `log` crate's global-logger API requires;
+    // it lives for the whole process anyway.
+    if log::set_boxed_logger(Box::new(TraceLogger { launched_at })).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
 }

@@ -39,6 +39,12 @@ fn main() -> eframe::Result {
             .expect("failed to spawn decode thread");
     }
 
+    // Constructed here rather than at the top of `main` so it stays below the decode
+    // spawn. Its marks are still measured from `launched_at`, so nothing is lost.
+    let trace = startup::StartupTrace::new(launched_at);
+    trace.mark("decode_spawned");
+    startup::install_init_logger(launched_at);
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
@@ -46,13 +52,22 @@ fn main() -> eframe::Result {
             .with_title("Imaginer")
             .with_drag_and_drop(true),
         renderer: renderer_choice(),
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            hardware_acceleration: hardware_acceleration_choice(),
+            vsync: !flag_disabled("IMAGINER_VSYNC"),
+            ..Default::default()
+        },
         ..Default::default()
     };
+
+    // Everything between this mark and `context_ready` is winit + glutin + the GPU
+    // driver, with no code of ours running in it.
+    trace.mark("run_native");
 
     eframe::run_native(
         "Imaginer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, launched_at, path, rx)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, trace, path, rx)))),
     )
 }
 
@@ -69,6 +84,28 @@ fn renderer_choice() -> eframe::Renderer {
         Ok("wgpu") => eframe::Renderer::Wgpu,
         _ => eframe::Renderer::Glow,
     }
+}
+
+/// Whether to ask for a hardware-accelerated GL context.
+///
+/// An investigation knob, not a setting anyone should need: `IMAGINER_HW_ACCEL=off`
+/// selects a software context, which skips loading the vendor's OpenGL driver
+/// entirely. Comparing that against the default is how the cost of context creation
+/// gets attributed to the driver rather than to winit or glutin. Rendering through
+/// it is far too slow to actually use.
+fn hardware_acceleration_choice() -> eframe::egui_glow::HardwareAcceleration {
+    use eframe::egui_glow::HardwareAcceleration;
+    match std::env::var("IMAGINER_HW_ACCEL").as_deref() {
+        Ok("off") => HardwareAcceleration::Off,
+        Ok("required") => HardwareAcceleration::Required,
+        _ => HardwareAcceleration::Preferred,
+    }
+}
+
+/// True when `name` is set to an explicit "off" value. Distinct from unset, so that
+/// the default stays on.
+fn flag_disabled(name: &str) -> bool {
+    matches!(std::env::var(name).as_deref(), Ok("0") | Ok("false"))
 }
 
 /// Decode in two passes: the embedded EXIF thumbnail first if there is one, then

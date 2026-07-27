@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Instant;
 
 use eframe::egui;
 use imaginer_core::Stage;
@@ -32,14 +31,14 @@ pub struct App {
 impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        launched_at: Instant,
+        trace: StartupTrace,
         path: Option<PathBuf>,
         rx: Receiver<LoadMessage>,
     ) -> Self {
-        let trace = StartupTrace::new(launched_at);
         // Reaching here means the window and GL context exist, so this mark splits
         // startup into "platform setup" and "our own work".
         trace.mark("context_ready");
+        trace.report_gl(cc.gl.as_deref());
 
         theme::install(&cc.egui_ctx);
         trace.mark("theme_ready");
