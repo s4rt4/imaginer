@@ -27,6 +27,9 @@ Usable as a daily viewer, with light editing. What works today:
 **Editing** — non-destructive; the original is only ever read
 
 - Flip, rotate, and mirror (the image beside its own reflection, so the canvas doubles)
+- Crop: drag a rectangle, move it, drag its corners, with aspect presets and a
+  thirds guide
+- Trim: take the fully transparent border off a PNG in one click
 - Undo/redo over the operation stack
 - Export to PNG, JPEG or BMP with quality and scale; save-as whenever the result
   would not simply replace the original
@@ -36,7 +39,7 @@ Usable as a daily viewer, with light editing. What works today:
 - Copy the file path, or send the file to the Recycle Bin — never `fs::remove_file`
 - Startup benchmark harness
 
-Not yet: crop, colour adjustment, filmstrip, prefetch and cache.
+Not yet: colour adjustment, filmstrip, prefetch and cache.
 
 ## Build and run
 
@@ -58,6 +61,7 @@ cargo run --release -- "C:\path\to\image.jpg"
 | `Space` | Start or stop the slideshow |
 | `E` | Toggle the edit sidebar |
 | `R` | Rotate 90° clockwise |
+| `C` | Crop — then `Enter` to apply, `Esc` to cancel |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | `Ctrl+S` | Save |
 | `Ctrl+Shift+C` | Copy the file path |

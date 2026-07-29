@@ -58,16 +58,40 @@ impl ViewState {
     }
 }
 
-/// Draw the image and handle interaction. Returns the zoom actually used, so the
-/// status bar can report it.
-pub fn show(ui: &mut egui::Ui, texture: &ImageTexture, state: &mut ViewState) -> f32 {
-    let (rect, response) =
-        ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+/// What the canvas drew this frame, so anything painted over it can line up.
+#[derive(Debug, Clone, Copy)]
+pub struct Shown {
+    /// Zoom actually used, which is what the status bar reports.
+    pub zoom: f32,
+    /// Where the image landed on screen.
+    pub image_rect: egui::Rect,
+}
+
+/// Draw the image and handle interaction.
+///
+/// `interactive` is false while cropping: the canvas belongs to the selection then,
+/// and a drag that panned the image and resized the crop rectangle at the same time
+/// would do neither well.
+pub fn show(
+    ui: &mut egui::Ui,
+    texture: &ImageTexture,
+    state: &mut ViewState,
+    interactive: bool,
+) -> Shown {
+    let sense = if interactive {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(ui.available_size(), sense);
     ui.painter().rect_filled(rect, 0.0, theme::CANVAS_BG);
 
     let natural = texture.source_vec();
     if natural.x <= 0.0 || natural.y <= 0.0 {
-        return 1.0;
+        return Shown {
+            zoom: 1.0,
+            image_rect: rect,
+        };
     }
 
     // Fit shrinks to the window but never enlarges — blowing a 32px icon up to
@@ -121,7 +145,7 @@ pub fn show(ui: &mut egui::Ui, texture: &ImageTexture, state: &mut ViewState) ->
         egui::Color32::WHITE,
     );
 
-    zoom
+    Shown { zoom, image_rect }
 }
 
 /// Which way a canvas chevron was asking to go.
@@ -145,13 +169,13 @@ const CHEVRON_ICON: f32 = 22.0;
 /// Here rather than in the toolbar because stepping through a folder is the single
 /// most repeated action in a viewer, so it belongs where the eye already is — and
 /// keeping it off the toolbar is precisely what lets that row stay short enough to
-/// read at a glance. They fade with the pointer so that looking at a photograph is
-/// not looking at two buttons on top of it.
+/// read at a glance. They come and go with the pointer so that looking at a
+/// photograph is not looking at two buttons on top of it.
 pub fn chevrons(
     ui: &mut egui::Ui,
     icons: &mut Icons,
     canvas: egui::Rect,
-    opacity: f32,
+    visible: bool,
 ) -> Option<Step> {
     let middle = canvas.center().y;
     let offset = CHEVRON_INSET + CHEVRON_RADIUS;
@@ -166,16 +190,15 @@ pub fn chevrons(
         )
     };
 
-    // A pointer resting on a chevron holds it open. Without this it fades out from
+    // A pointer resting on a chevron holds it open. Without this it disappears from
     // under the cursor, and the thing you were about to click stops existing.
     let pointer = ui.input(|i| i.pointer.hover_pos());
     let held_open = pointer.is_some_and(|at| sides.iter().any(|(_, _, x)| disc(*x).contains(at)));
-    let opacity = if held_open { 1.0 } else { opacity };
 
-    // Nothing is drawn when they are invisible, and nothing is claimed either:
-    // an invisible chevron that still swallowed clicks would break panning near
-    // the edges of the image.
-    if opacity <= 0.0 {
+    // Nothing is drawn when they are hidden, and nothing is claimed either: an
+    // invisible chevron that still swallowed clicks would break panning near the
+    // edges of the image.
+    if !visible && !held_open {
         return None;
     }
 
@@ -185,9 +208,9 @@ pub fn chevrons(
         let response = ui.interact(rect, ui.id().with(direction as u8), egui::Sense::click());
 
         let backdrop = if response.hovered() {
-            theme::PANEL_BG.gamma_multiply(0.92 * opacity)
+            theme::PANEL_BG.gamma_multiply(0.92)
         } else {
-            theme::PANEL_BG.gamma_multiply(0.66 * opacity)
+            theme::PANEL_BG.gamma_multiply(0.66)
         };
         ui.painter()
             .circle_filled(rect.center(), CHEVRON_RADIUS, backdrop);
@@ -196,7 +219,7 @@ pub fn chevrons(
             icons,
             icon,
             egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(CHEVRON_ICON)),
-            theme::TEXT_PRIMARY.gamma_multiply(opacity),
+            theme::TEXT_PRIMARY,
         );
 
         if response.clicked() {

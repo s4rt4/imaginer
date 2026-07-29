@@ -14,7 +14,8 @@ use crate::idle;
 use crate::logo;
 use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
-use crate::views::{sidebar, statusbar, toolbar, viewer};
+use crate::views::crop::CropState;
+use crate::views::{crop, sidebar, statusbar, toolbar, viewer};
 use crate::{LoadMessage, decode_into, theme, titlebar};
 
 /// How long a status-bar notice stays up. Long enough to read in passing, short
@@ -68,11 +69,19 @@ pub struct App {
     /// Set once a frame has been painted, which is when scanning the folder stops
     /// being something the user is waiting on.
     painted: bool,
+    /// True between asking for an image and the first pixels of it arriving. What
+    /// is on screen until then belongs to the previous one.
+    awaiting_first_frame: bool,
     sidebar_open: bool,
+    /// The crop being drawn, if the canvas is currently in that mode.
+    crop: Option<CropState>,
     export: imaginer_core::ExportSettings,
     /// Where the save worker reports back: the file it wrote, or why it could not.
     save_rx: Receiver<Result<PathBuf, String>>,
     saving: bool,
+    /// Where the trim worker reports the opaque bounds it measured.
+    trim_rx: Receiver<Option<(u32, u32, u32, u32)>>,
+    trimming: bool,
     /// Uploaded the first time the empty state is drawn, so launching with an image
     /// never pays for it.
     logotype: Option<egui::TextureHandle>,
@@ -123,10 +132,14 @@ impl App {
             applying: false,
             slideshow: None,
             painted: false,
+            awaiting_first_frame: false,
             sidebar_open: false,
+            crop: None,
             export,
             save_rx: std::sync::mpsc::channel().1,
             saving: false,
+            trim_rx: std::sync::mpsc::channel().1,
+            trimming: false,
             logotype: None,
             icons: Icons::default(),
         }
@@ -172,13 +185,19 @@ impl App {
 
         self.file_size = file_size(&path);
         self.path = Some(path.clone());
-        self.texture = None;
         self.stage = None;
         self.error = None;
         self.notice = None;
-        self.view.reset();
         self.loading = true;
         self.texture_generation += 1;
+
+        // The outgoing image stays up until its replacement is ready. Clearing it
+        // here instead would flash the empty state — logo, "drop an image here" —
+        // between every pair of photographs, which is the same reason there is no
+        // spinner: a window that empties and refills reads as jankier than one that
+        // waits the extra 50ms. The view is refitted when the new pixels land, not
+        // now, or the old image would visibly snap to fit on its way out.
+        self.awaiting_first_frame = true;
 
         // Edits belong to the image they were made on. Carrying them across would
         // silently rotate the next photo because of something done to the last one.
@@ -205,6 +224,13 @@ impl App {
                     self.stage = Some(stage);
                     self.texture = Some(texture::upload(ctx, &name, &decoded));
                     self.error = None;
+
+                    // Fit the new image, once. Not on the full decode that follows a
+                    // preview, which would throw away a zoom set while it loaded.
+                    if self.awaiting_first_frame {
+                        self.awaiting_first_frame = false;
+                        self.view.reset();
+                    }
                     // A preview means the full decode is still coming.
                     self.loading = stage == Stage::Preview;
 
@@ -218,6 +244,13 @@ impl App {
                 Ok(LoadMessage::Failed(message)) => {
                     self.error = Some(message);
                     self.loading = false;
+                    // Now the previous image does have to go: leaving it up beside
+                    // the new filename would claim to be a file that would not open.
+                    if self.awaiting_first_frame {
+                        self.awaiting_first_frame = false;
+                        self.texture = None;
+                        self.view.reset();
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 // Sender gone with nothing more to say — the decode finished.
@@ -331,8 +364,8 @@ impl App {
             )
         });
 
-        let (escape, fullscreen, delete, prev, next, rotate, sidebar, slideshow) =
-            ctx.input_mut(|i| {
+        let (escape, fullscreen, delete, prev, next, rotate, sidebar, slideshow, start_crop) = ctx
+            .input_mut(|i| {
                 (
                     i.consume_key(NONE, Key::Escape),
                     i.consume_key(NONE, Key::F11),
@@ -342,12 +375,18 @@ impl App {
                     i.consume_key(NONE, Key::R),
                     i.consume_key(NONE, Key::E),
                     i.consume_key(NONE, Key::Space),
+                    i.consume_key(NONE, Key::C),
                 )
             });
+        let enter = ctx.input_mut(|i| i.consume_key(NONE, Key::Enter));
 
         if escape {
-            // Escape means "back out of where I am", so it leaves fullscreen
-            // before it closes the app.
+            // Escape means "back out of where I am", and cropping is the innermost
+            // place to be.
+            if self.crop.is_some() {
+                self.crop = None;
+                return;
+            }
             if self.fullscreen {
                 self.set_fullscreen(ctx, false);
             } else {
@@ -365,6 +404,15 @@ impl App {
         }
 
         if self.texture.is_none() {
+            return;
+        }
+
+        // Cropping is modal: the keys that would step to another image or push
+        // another transform belong to the selection until it is committed.
+        if self.crop.is_some() {
+            if enter {
+                self.apply_crop(ctx);
+            }
             return;
         }
 
@@ -393,6 +441,9 @@ impl App {
         }
         if slideshow && self.has_neighbours() {
             self.toggle_slideshow();
+        }
+        if start_crop {
+            self.start_crop();
         }
         if undo {
             self.undo(ctx);
@@ -439,7 +490,117 @@ impl App {
             sidebar::Action::Undo => self.undo(ctx),
             sidebar::Action::Redo => self.redo(ctx),
             sidebar::Action::Save => self.save(ctx),
+            sidebar::Action::Trim => self.request_trim(ctx),
+            sidebar::Action::StartCrop => self.start_crop(),
+            sidebar::Action::SetAspect(aspect) => {
+                // Read before the mutable borrow: `edited_size` is a method, so it
+                // borrows all of `self`.
+                let size = self.edited_size();
+                if let (Some(crop), Some(size)) = (self.crop.as_mut(), size) {
+                    crop.set_aspect(aspect, size);
+                }
+            }
+            sidebar::Action::ApplyCrop => self.apply_crop(ctx),
+            sidebar::Action::CancelCrop => self.crop = None,
         }
+    }
+
+    /// Size of the image as the pipeline currently produces it, which is what a
+    /// crop rectangle is measured against.
+    fn edited_size(&self) -> Option<(u32, u32)> {
+        self.source
+            .as_ref()
+            .map(|source| self.edits.size_after(source.dimensions()))
+    }
+
+    fn start_crop(&mut self) {
+        if self.source.is_none() {
+            return;
+        }
+
+        // Fit first: a selection can only be drawn over what is on screen, so
+        // starting a crop while zoomed into a corner would silently put most of the
+        // image out of reach.
+        self.view.reset();
+        self.sidebar_open = true;
+        self.crop = Some(CropState::new(
+            self.crop
+                .as_ref()
+                .map_or_else(Default::default, |c| c.aspect),
+        ));
+    }
+
+    /// Measure the transparent border, off the UI thread.
+    ///
+    /// The answer depends on the pixels rather than on the size, so it cannot be an
+    /// op of its own — the export panel has to be able to predict output dimensions
+    /// without running the pipeline. What comes back becomes an ordinary crop, which
+    /// keeps the stack honest about what happened and undoes like anything else.
+    fn request_trim(&mut self, ctx: &egui::Context) {
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        let edits = self.edits.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.trim_rx = rx;
+        self.trimming = true;
+
+        std::thread::Builder::new()
+            .name("trim".to_owned())
+            .spawn(move || {
+                let pixels = edits.apply(&source);
+                let _ = tx.send(imaginer_core::edit::opaque_bounds(&pixels));
+            })
+            .expect("failed to spawn trim thread");
+
+        ctx.request_repaint();
+    }
+
+    fn poll_trim(&mut self, ctx: &egui::Context) {
+        let bounds = match self.trim_rx.try_recv() {
+            Ok(bounds) => bounds,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.trimming = false;
+                return;
+            }
+        };
+        self.trimming = false;
+
+        let current = self.edited_size();
+        match bounds {
+            // Nothing transparent to take away. Saying so beats pushing a crop that
+            // changes nothing and still costs an undo to get rid of.
+            Some((0, 0, w, h)) if Some((w, h)) == current => self.notify("Nothing to trim"),
+            Some((x, y, width, height)) => self.push_op(
+                ctx,
+                Op::Crop {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+            ),
+            None => self.notify("The whole image is transparent"),
+        }
+    }
+
+    fn apply_crop(&mut self, ctx: &egui::Context) {
+        let Some((x, y, width, height)) = self.crop.as_ref().and_then(CropState::rectangle) else {
+            return;
+        };
+
+        self.crop = None;
+        self.push_op(
+            ctx,
+            Op::Crop {
+                x,
+                y,
+                width,
+                height,
+            },
+        );
     }
 
     /// Write the edited pixels out.
@@ -760,6 +921,10 @@ impl eframe::App for App {
             self.poll_save(&ctx);
             ctx.request_repaint();
         }
+        if self.trimming {
+            self.poll_trim(&ctx);
+            ctx.request_repaint();
+        }
 
         self.tick_notice(&ctx);
         // Before the shortcut handler, which consumes the very key presses that
@@ -771,8 +936,8 @@ impl eframe::App for App {
 
         // Fullscreen means the photograph, not a photograph with a toolbar over it.
         // The chrome comes back the moment the pointer moves.
-        let chrome = idle::opacity(&ctx);
-        let show_chrome = !self.fullscreen || chrome > 0.0;
+        let chrome = idle::visible(&ctx);
+        let show_chrome = !self.fullscreen || chrome;
 
         let base_frame = egui::Frame::side_top_panel(ui.style());
         let toolbar_frame = base_frame.inner_margin(egui::Margin::symmetric(10, 7));
@@ -844,6 +1009,10 @@ impl eframe::App for App {
                                 .as_deref()
                                 .and_then(imaginer_core::Format::from_path),
                             has_image: self.source.is_some(),
+                            cropping: self.crop.as_ref().map(|crop| sidebar::Cropping {
+                                aspect: crop.aspect,
+                                selection: crop.rectangle().map(|(_, _, w, h)| (w, h)),
+                            }),
                         },
                     );
                 });
@@ -855,9 +1024,19 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 if let Some(texture) = self.texture.as_ref() {
                     let canvas = ui.max_rect();
-                    self.last_zoom = viewer::show(ui, texture, &mut self.view);
-                    if has_neighbours {
-                        requested_step = viewer::chevrons(ui, &mut self.icons, canvas, chrome);
+                    let shown = viewer::show(ui, texture, &mut self.view, self.crop.is_none());
+                    self.last_zoom = shown.zoom;
+
+                    match self.crop.as_mut() {
+                        Some(state) => {
+                            crop::overlay(ui, state, texture.source_size, shown.image_rect, canvas)
+                        }
+                        // Chevrons would step to another image mid-crop, which is
+                        // not something a half-drawn selection should survive.
+                        None if has_neighbours => {
+                            requested_step = viewer::chevrons(ui, &mut self.icons, canvas, chrome);
+                        }
+                        None => {}
                     }
                     self.trace.mark_first_image();
                 } else {

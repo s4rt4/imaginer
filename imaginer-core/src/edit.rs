@@ -34,6 +34,17 @@ pub enum Op {
     MirrorHorizontal,
     /// Place the image below its own reflection, doubling the height.
     MirrorVertical,
+    /// Keep a rectangle of the image and discard the rest.
+    ///
+    /// In pixels of the image *as the pipeline reaches this step*, not of the file
+    /// on disk — a crop after a rotate is measured against the rotated image, which
+    /// is the only reading that survives an undo of the step before it.
+    Crop {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
 }
 
 impl Op {
@@ -53,7 +64,34 @@ impl Op {
             Self::RotateCw | Self::RotateCcw => (h, w),
             Self::MirrorHorizontal => (w.saturating_mul(2), h),
             Self::MirrorVertical => (w, h.saturating_mul(2)),
+            Self::Crop { .. } => {
+                let (_, _, cw, ch) = self.clamped_crop(size);
+                (cw, ch)
+            }
         }
+    }
+
+    /// A crop rectangle trimmed to what actually exists in an image of `size`.
+    ///
+    /// The rectangle is stored as the user drew it, but the image under it can
+    /// change afterwards — undoing the rotate that came before it, say. Rather than
+    /// invalidating the crop, it is clamped: an op that survives editing of the ops
+    /// before it is far less surprising than one that silently disappears, and a
+    /// crop that fell entirely outside would panic the underlying view.
+    fn clamped_crop(self, size: (u32, u32)) -> (u32, u32, u32, u32) {
+        let Self::Crop {
+            x,
+            y,
+            width,
+            height,
+        } = self
+        else {
+            return (0, 0, size.0, size.1);
+        };
+
+        let x = x.min(size.0);
+        let y = y.min(size.1);
+        (x, y, width.min(size.0 - x), height.min(size.1 - y))
     }
 
     fn apply(self, src: &RgbaImage) -> RgbaImage {
@@ -65,8 +103,50 @@ impl Op {
             Self::RotateCcw => imageops::rotate270(src),
             Self::MirrorHorizontal => mirror(src, false),
             Self::MirrorVertical => mirror(src, true),
+            Self::Crop { .. } => {
+                let (x, y, width, height) = self.clamped_crop(src.dimensions());
+                if width == 0 || height == 0 {
+                    // Nothing left to keep. Handing back the original beats handing
+                    // back an image with a zero dimension, which nothing downstream
+                    // — texture upload, encoders — is prepared for.
+                    return src.clone();
+                }
+                imageops::crop_imm(src, x, y, width, height).to_image()
+            }
         }
     }
+}
+
+/// The smallest rectangle containing every pixel that is not fully transparent,
+/// as `(x, y, width, height)`.
+///
+/// `None` when the image is entirely transparent, because there is then no
+/// rectangle to keep and cropping to nothing is not an improvement. Returns the
+/// whole image when nothing is transparent at all — the common case for a
+/// photograph, and worth checking before pushing a crop that would do nothing.
+///
+/// Deliberately not an [`Op`]. Every op has to be able to report its output size
+/// from an input size alone, so the export panel can predict dimensions without
+/// doing the work; a trim's result depends on the pixels, not on the size. So the
+/// caller measures once and pushes an ordinary [`Op::Crop`], which keeps the
+/// pipeline predictable and makes the undo stack say what actually happened.
+pub fn opaque_bounds(pixels: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
+    let (mut min_x, mut min_y) = (u32::MAX, u32::MAX);
+    let (mut max_x, mut max_y) = (0u32, 0u32);
+    let mut found = false;
+
+    for (x, y, pixel) in pixels.enumerate_pixels() {
+        if pixel.0[3] == 0 {
+            continue;
+        }
+        found = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+
+    found.then(|| (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
 }
 
 /// The image beside (or below) its own reflection.
@@ -304,6 +384,104 @@ mod tests {
         edits.push(Op::FlipHorizontal);
         assert!(!edits.can_redo());
         assert_eq!(edits.ops(), [Op::FlipHorizontal]);
+    }
+
+    #[test]
+    fn cropping_keeps_the_rectangle_that_was_asked_for() {
+        let src = asymmetric();
+        let mut edits = Edits::default();
+        edits.push(Op::Crop {
+            x: 1,
+            y: 0,
+            width: 2,
+            height: 2,
+        });
+        let out = edits.apply(&src).into_owned();
+
+        assert_eq!(out.dimensions(), (2, 2));
+        assert_eq!(out.get_pixel(0, 0), src.get_pixel(1, 0));
+        assert_eq!(out.get_pixel(1, 1), src.get_pixel(2, 1));
+    }
+
+    #[test]
+    fn a_crop_reaching_past_the_edge_is_trimmed_rather_than_fatal() {
+        let src = asymmetric(); // 4x2
+        let mut edits = Edits::default();
+        edits.push(Op::Crop {
+            x: 3,
+            y: 1,
+            width: 999,
+            height: 999,
+        });
+
+        let predicted = edits.size_after(src.dimensions());
+        let out = edits.apply(&src).into_owned();
+        assert_eq!(out.dimensions(), (1, 1));
+        assert_eq!(out.dimensions(), predicted);
+    }
+
+    #[test]
+    fn a_crop_entirely_outside_the_image_leaves_it_alone() {
+        // Reachable by undoing the op that made the image big enough for it.
+        let src = asymmetric();
+        let mut edits = Edits::default();
+        edits.push(Op::Crop {
+            x: 40,
+            y: 40,
+            width: 10,
+            height: 10,
+        });
+
+        assert_eq!(*edits.apply(&src), src);
+    }
+
+    #[test]
+    fn a_crop_is_measured_against_the_image_the_pipeline_reaches_it_with() {
+        // 4x2 rotated clockwise is 2x4, so a crop 3 rows down is only in range
+        // after the rotation — which is exactly the point.
+        let src = asymmetric();
+        let mut edits = Edits::default();
+        edits.push(Op::RotateCw);
+        edits.push(Op::Crop {
+            x: 0,
+            y: 3,
+            width: 2,
+            height: 1,
+        });
+
+        assert_eq!(edits.apply(&src).dimensions(), (2, 1));
+    }
+
+    #[test]
+    fn an_opaque_image_has_nothing_to_trim() {
+        let src = asymmetric();
+        assert_eq!(opaque_bounds(&src), Some((0, 0, 4, 2)));
+    }
+
+    #[test]
+    fn trimming_finds_the_content_inside_a_transparent_border() {
+        // 6x6 of nothing, with a 2x3 opaque block at (2, 1).
+        let mut src = RgbaImage::from_pixel(6, 6, image::Rgba([0, 0, 0, 0]));
+        for y in 1..4 {
+            for x in 2..4 {
+                src.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+
+        assert_eq!(opaque_bounds(&src), Some((2, 1, 2, 3)));
+    }
+
+    #[test]
+    fn a_fully_transparent_image_has_no_bounds_at_all() {
+        let src = RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 0]));
+        assert_eq!(opaque_bounds(&src), None);
+    }
+
+    #[test]
+    fn a_single_opaque_pixel_is_a_one_by_one_rectangle() {
+        let mut src = RgbaImage::from_pixel(5, 5, image::Rgba([0, 0, 0, 0]));
+        src.put_pixel(3, 4, image::Rgba([1, 2, 3, 1]));
+        assert_eq!(opaque_bounds(&src), Some((3, 4, 1, 1)));
     }
 
     #[test]

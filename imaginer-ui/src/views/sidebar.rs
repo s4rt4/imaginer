@@ -11,6 +11,7 @@ use imaginer_core::{Edits, ExportSettings, Format, Op};
 
 use crate::icons::{self, Icon, Icons};
 use crate::theme;
+use crate::views::crop::Aspect;
 
 /// Sidebar width. Wide enough for the export controls to breathe, narrow enough
 /// that opening it does not shove the photograph off centre.
@@ -24,6 +25,19 @@ pub enum Action {
     Undo,
     Redo,
     Save,
+    Trim,
+    StartCrop,
+    SetAspect(Aspect),
+    ApplyCrop,
+    CancelCrop,
+}
+
+/// The crop half of the sidebar's state, present only while cropping.
+#[derive(Debug, Clone, Copy)]
+pub struct Cropping {
+    pub aspect: Aspect,
+    /// The selection so far, in image pixels.
+    pub selection: Option<(u32, u32)>,
 }
 
 pub struct State<'a> {
@@ -35,6 +49,7 @@ pub struct State<'a> {
     /// overwrite that file or write a new one.
     pub source_format: Option<Format>,
     pub has_image: bool,
+    pub cropping: Option<Cropping>,
 }
 
 pub fn show(ui: &mut egui::Ui, icons: &mut Icons, state: &mut State<'_>) -> Option<Action> {
@@ -53,12 +68,19 @@ pub fn show(ui: &mut egui::Ui, icons: &mut Icons, state: &mut State<'_>) -> Opti
     egui::Frame::NONE
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
-            if let Some(requested) = header(ui, icons) {
+            if let Some(requested) = header(ui, icons, state.cropping.is_some()) {
                 action = Some(requested);
             }
             ui.add_space(8.0);
 
-            if let Some(requested) = transform(ui, icons, state) {
+            // Cropping takes over this half of the sidebar. It is a mode with its
+            // own commit, so leaving the transform buttons alongside would offer
+            // edits that cannot be applied until it is finished with.
+            let requested = match state.cropping {
+                Some(cropping) => cropping_controls(ui, cropping),
+                None => transform(ui, icons, state),
+            };
+            if let Some(requested) = requested {
                 action = Some(requested);
             }
         });
@@ -66,16 +88,80 @@ pub fn show(ui: &mut egui::Ui, icons: &mut Icons, state: &mut State<'_>) -> Opti
     action
 }
 
-fn header(ui: &mut egui::Ui, icons: &mut Icons) -> Option<Action> {
+fn header(ui: &mut egui::Ui, icons: &mut Icons, cropping: bool) -> Option<Action> {
     let mut action = None;
 
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Edit").strong());
+        ui.label(egui::RichText::new(if cropping { "Crop" } else { "Edit" }).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if icons::button(ui, icons, Icon::X, "Close the sidebar (E)").clicked() {
-                action = Some(Action::Close);
+            // While cropping, the close button backs out of the mode rather than
+            // the sidebar — leaving the sidebar with a selection still half-drawn
+            // over the canvas would strand the user in a mode with no controls.
+            let (tooltip, requested) = if cropping {
+                ("Cancel the crop (Esc)", Action::CancelCrop)
+            } else {
+                ("Close the sidebar (E)", Action::Close)
+            };
+            if icons::button(ui, icons, Icon::X, tooltip).clicked() {
+                action = Some(requested);
             }
         });
+    });
+
+    action
+}
+
+fn cropping_controls(ui: &mut egui::Ui, cropping: Cropping) -> Option<Action> {
+    let mut action = None;
+
+    section(ui, "Aspect");
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        for aspect in Aspect::ALL {
+            let selected = aspect == cropping.aspect;
+            if ui
+                .selectable_label(selected, aspect.label())
+                .on_hover_text(if aspect == Aspect::Free {
+                    "Any shape"
+                } else {
+                    "Lock the selection to this ratio"
+                })
+                .clicked()
+                && !selected
+            {
+                action = Some(Action::SetAspect(aspect));
+            }
+        }
+    });
+
+    ui.add_space(10.0);
+    match cropping.selection {
+        Some((w, h)) => {
+            ui.colored_label(theme::TEXT_MUTED, format!("{w} × {h} px"));
+        }
+        None => {
+            ui.colored_label(theme::TEXT_MUTED, "Drag a rectangle on the image");
+        }
+    }
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(cropping.selection.is_some(), |ui| {
+            if ui
+                .button("Apply")
+                .on_hover_text("Crop to the selection (Enter)")
+                .clicked()
+            {
+                action = Some(Action::ApplyCrop);
+            }
+        });
+        if ui
+            .button("Cancel")
+            .on_hover_text("Leave the image as it is (Esc)")
+            .clicked()
+        {
+            action = Some(Action::CancelCrop);
+        }
     });
 
     action
@@ -136,6 +222,28 @@ fn transform(ui: &mut egui::Ui, icons: &mut Icons, state: &State<'_>) -> Option<
                         ),
                     ],
                 );
+
+                // The last row of the same grid, so it keeps the rhythm of the
+                // others. Only one button, because crop opens a mode rather than
+                // offering a pair of directions.
+                // Both take away the outside of the image, which is why they share
+                // a row; the difference is only whether you say where, or the
+                // transparency does.
+                ui.colored_label(theme::TEXT_MUTED, "Crop");
+                if icons::button(ui, icons, Icon::Crop, "Draw a rectangle to keep (C)").clicked() {
+                    action = Some(Action::StartCrop);
+                }
+                if icons::button(
+                    ui,
+                    icons,
+                    Icon::PngTrim,
+                    "Trim fully transparent edges away",
+                )
+                .clicked()
+                {
+                    action = Some(Action::Trim);
+                }
+                ui.end_row();
             });
 
         ui.add_space(10.0);
