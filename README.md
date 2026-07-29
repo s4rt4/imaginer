@@ -5,21 +5,33 @@ Personal tool, not a distributed product.
 
 ## Status
 
-Phase 1 in progress. What works today:
+Usable as a daily viewer, with light editing. What works today:
 
-- Opens an image passed on the command line (so "Open With" / file association works)
-  or dropped onto the window
+**Viewing**
+
+- Opens an image passed on the command line (so "Open With" / file association works),
+  dropped onto the window, or picked through the native Open dialog
 - PNG, JPEG, BMP, GIF (static), WebP (static)
 - EXIF orientation applied on load, so phone photos are the right way up
 - Two-stage decode: the embedded EXIF thumbnail appears first, the full image
   swaps in behind it
-- Pan, zoom (scroll wheel, anchored at the cursor), fit-to-window, 90° view rotation
+- Pan, zoom (scroll wheel, anchored at the cursor), fit-to-window
 - Oversized images downscaled to the GPU's texture limit rather than failing
-- Custom dark theme, toolbar, status bar
+- Next/previous through the containing folder, fullscreen, dark window chrome
+
+**Editing** — non-destructive; the original is only ever read
+
+- Flip, rotate, and mirror (the image beside its own reflection, so the canvas doubles)
+- Undo/redo over the operation stack
+- Export to PNG, JPEG or BMP with quality and scale; save-as whenever the result
+  would not simply replace the original
+
+**Housekeeping**
+
+- Copy the file path, or send the file to the Recycle Bin — never `fs::remove_file`
 - Startup benchmark harness
 
-Not yet: folder navigation, filmstrip, prefetch, cache, editing, the Open dialog.
-See the roadmap for the full list.
+Not yet: crop, colour adjustment, slideshow, filmstrip, prefetch and cache.
 
 ## Build and run
 
@@ -31,12 +43,26 @@ cargo run --release -- "C:\path\to\image.jpg"
 
 | Key | Action |
 |---|---|
+| `Ctrl+O` / `Ctrl+Shift+O` | Open an image / a folder |
+| `←` / `→` | Previous / next image in the folder |
 | `F` / `0` | Fit to window |
 | `1` | Actual size (100%) |
-| `R` | Rotate view 90° |
 | `+` / `-` | Zoom |
 | Double-click | Toggle fit / 100% |
-| `Esc` | Close |
+| `F11` | Fullscreen |
+| `E` | Toggle the edit sidebar |
+| `R` | Rotate 90° clockwise |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
+| `Ctrl+S` | Save |
+| `Ctrl+Shift+C` | Copy the file path |
+| `Del` | Move to the Recycle Bin |
+| `Esc` | Leave fullscreen, or close |
+
+There is exactly one rotation, and it is an edit: the old view-only rotate was
+dropped when the sidebar arrived. Two buttons that look identical and differ only
+in whether the result can be saved is a trap. Because the pipeline is
+non-destructive, straightening a crooked photo just to look at it still costs
+nothing.
 
 ## Startup measurement
 
@@ -145,11 +171,18 @@ $env:IMAGINER_RENDERER = "wgpu"
 ## Layout
 
 ```
-assets/          logo artwork (SVG); not wired into the app yet
-imaginer-core/   decode, EXIF, (later) cache and edit ops — no UI dependency
-imaginer-ui/     eframe app: viewer canvas, theme, toolbar, status bar
+assets/          logo artwork and the UI icon set, as SVG
+imaginer-core/   decode, EXIF, folder listing, edit pipeline, export — no UI dependency
+imaginer-ui/     eframe app: canvas, theme, toolbar, status bar, edit sidebar
 scripts/         startup benchmarks
 ```
 
 `imaginer-core` must never gain a UI dependency; that split is what keeps the
 image logic testable without opening a window.
+
+Nothing renders SVG at runtime. `imaginer-ui/build.rs` rasterises the logo with
+resvg at build time, and the icons alongside it — icons are monochrome strokes, so
+only the alpha channel is kept (~2KB each) and the colour arrives at draw time from
+the widget's own foreground colour. That is what makes hover, disabled and active
+states free, and it keeps an SVG renderer out of a binary whose whole point is how
+fast it starts.

@@ -3,10 +3,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod icons;
 mod logo;
 mod startup;
 mod texture;
 mod theme;
+mod titlebar;
 mod views;
 
 use std::path::PathBuf;

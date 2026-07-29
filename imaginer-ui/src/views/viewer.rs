@@ -11,6 +11,14 @@ const MAX_ZOOM: f32 = 32.0;
 /// clamp it is easy to fling the image out of view and be left staring at nothing.
 const PAN_KEEP_VISIBLE: f32 = 48.0;
 
+/// How the image is currently being looked at.
+///
+/// Deliberately without a rotation of its own. There used to be one, turning the
+/// view without touching the file; it was dropped when the edit sidebar arrived,
+/// because two buttons that look identical and differ only in whether the result
+/// can be saved is a trap. Rotation is an edit now, and the pipeline being
+/// non-destructive means straightening a crooked photo just to look at it still
+/// costs nothing.
 pub struct ViewState {
     /// Zoom used when not fitting. 1.0 means one image pixel per point.
     pub zoom: f32,
@@ -18,8 +26,6 @@ pub struct ViewState {
     pub offset: egui::Vec2,
     /// While set, zoom is recomputed from the window size every frame.
     pub fit: bool,
-    /// View-only rotation, 0-3 clockwise quarter turns. Does not touch pixels.
-    pub quarter_turns: u8,
 }
 
 impl Default for ViewState {
@@ -28,7 +34,6 @@ impl Default for ViewState {
             zoom: 1.0,
             offset: egui::Vec2::ZERO,
             fit: true,
-            quarter_turns: 0,
         }
     }
 }
@@ -36,11 +41,6 @@ impl Default for ViewState {
 impl ViewState {
     pub fn reset(&mut self) {
         *self = Self::default();
-    }
-
-    pub fn rotate_clockwise(&mut self) {
-        self.quarter_turns = (self.quarter_turns + 1) % 4;
-        self.offset = egui::Vec2::ZERO;
     }
 
     /// Switch to a fixed zoom, centred.
@@ -55,15 +55,6 @@ impl ViewState {
         self.fit = false;
         self.zoom = (effective * factor).clamp(MIN_ZOOM, MAX_ZOOM);
     }
-
-    /// Size the image occupies on screen at 100%, accounting for view rotation.
-    fn oriented_size(&self, size: egui::Vec2) -> egui::Vec2 {
-        if self.quarter_turns % 2 == 1 {
-            egui::vec2(size.y, size.x)
-        } else {
-            size
-        }
-    }
 }
 
 /// Draw the image and handle interaction. Returns the zoom actually used, so the
@@ -73,7 +64,7 @@ pub fn show(ui: &mut egui::Ui, texture: &ImageTexture, state: &mut ViewState) ->
         ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
     ui.painter().rect_filled(rect, 0.0, theme::CANVAS_BG);
 
-    let natural = state.oriented_size(texture.source_vec());
+    let natural = texture.source_vec();
     if natural.x <= 0.0 || natural.y <= 0.0 {
         return 1.0;
     }
@@ -122,7 +113,12 @@ pub fn show(ui: &mut egui::Ui, texture: &ImageTexture, state: &mut ViewState) ->
     state.offset = clamp_offset(state.offset, displayed, rect.size());
 
     let image_rect = egui::Rect::from_center_size(rect.center() + state.offset, displayed);
-    paint_image(ui, texture, image_rect, rect, state.quarter_turns);
+    ui.painter_at(rect).image(
+        texture.handle.id(),
+        image_rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
 
     zoom
 }
@@ -136,68 +132,9 @@ fn clamp_offset(offset: egui::Vec2, displayed: egui::Vec2, canvas: egui::Vec2) -
     )
 }
 
-fn paint_image(
-    ui: &egui::Ui,
-    texture: &ImageTexture,
-    image_rect: egui::Rect,
-    clip: egui::Rect,
-    quarter_turns: u8,
-) {
-    let painter = ui.painter_at(clip);
-
-    // Built by hand rather than with `add_rect_with_uv` because view rotation is
-    // expressed by rotating which corner of the texture each vertex samples —
-    // a UV `Rect` cannot represent that.
-    let corners = [
-        image_rect.left_top(),
-        image_rect.right_top(),
-        image_rect.right_bottom(),
-        image_rect.left_bottom(),
-    ];
-    let base_uv = [
-        egui::pos2(0.0, 0.0),
-        egui::pos2(1.0, 0.0),
-        egui::pos2(1.0, 1.0),
-        egui::pos2(0.0, 1.0),
-    ];
-
-    let turns = (quarter_turns % 4) as usize;
-    let mut mesh = egui::Mesh::with_texture(texture.handle.id());
-    for (i, pos) in corners.iter().enumerate() {
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: *pos,
-            uv: base_uv[(i + 4 - turns) % 4],
-            color: egui::Color32::WHITE,
-        });
-    }
-    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-
-    painter.add(egui::Shape::mesh(mesh));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn quarter_turns_swap_the_oriented_size() {
-        let landscape = egui::vec2(800.0, 600.0);
-        let state_for = |quarter_turns| ViewState {
-            quarter_turns,
-            ..Default::default()
-        };
-
-        assert_eq!(state_for(0).oriented_size(landscape), landscape);
-        assert_eq!(
-            state_for(1).oriented_size(landscape),
-            egui::vec2(600.0, 800.0)
-        );
-        assert_eq!(state_for(2).oriented_size(landscape), landscape);
-        assert_eq!(
-            state_for(3).oriented_size(landscape),
-            egui::vec2(600.0, 800.0)
-        );
-    }
 
     #[test]
     fn offset_is_clamped_so_the_image_cannot_leave_the_screen() {
@@ -219,14 +156,5 @@ mod tests {
             egui::vec2(10.0, 10.0),
         );
         assert_eq!(clamped, egui::Vec2::ZERO);
-    }
-
-    #[test]
-    fn rotating_four_times_returns_to_the_start() {
-        let mut state = ViewState::default();
-        for _ in 0..4 {
-            state.rotate_clockwise();
-        }
-        assert_eq!(state.quarter_turns, 0);
     }
 }

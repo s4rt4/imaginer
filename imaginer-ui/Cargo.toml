@@ -23,6 +23,26 @@ eframe = { version = "0.35.0", default-features = false, features = ["glow"] }
 # predictable branch on an atomic — nothing that shows up in startup.
 log = "0.4"
 
+# Native file dialogs. `default-features = false` drops the xdg-portal and Wayland
+# backends, which are Linux-only and unreachable from here.
+rfd = { version = "0.17.2", default-features = false }
+
+# Clipboard. Text only for now: the `image-data` default feature pulls in a second
+# copy of `image` and a GDI dependency, and copy-image is a Phase 3 item.
+arboard = { version = "3.6.1", default-features = false }
+
+# Deleting goes to the Recycle Bin, never `fs::remove_file` — an image viewer that
+# can silently destroy an original is not a tool anyone should trust.
+trash = "5.2.6"
+
+# Pinned to the version eframe itself resolves, so `CreationContext`'s handle and
+# ours are the same type rather than two incompatible copies of it.
+raw-window-handle = "0.6.2"
+
+[target.'cfg(windows)'.dependencies]
+# Only for `DwmSetWindowAttribute`, which is what makes the title bar dark.
+windows-sys = { version = "0.61.2", features = ["Win32_Graphics_Dwm"] }
+
 [build-dependencies]
 # Rasterises the logo SVGs at build time so the shipping binary carries pixels, not
 # an SVG renderer. `text` is off because the artwork is all paths -- that drops

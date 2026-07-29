@@ -13,6 +13,27 @@ use std::path::Path;
 
 use crate::metadata::{self, Orientation};
 
+/// File extensions this build can decode, lower-case and without the dot.
+///
+/// Mirrors the `image` feature list in `Cargo.toml` — a new format has to be added
+/// in both places. Everything that needs to ask "is this an image?" reads it from
+/// here: the open dialog's filter today, the folder listing next.
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+
+/// Whether `path` looks like something this build can open.
+///
+/// Extension-based on purpose: this is used to filter directory listings, where
+/// sniffing the contents of every file would mean opening all of them.
+pub fn is_supported(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            SUPPORTED_EXTENSIONS
+                .iter()
+                .any(|supported| ext.eq_ignore_ascii_case(supported))
+        })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("could not read {path}: {source}")]
@@ -68,21 +89,35 @@ impl Decoded {
     /// has to be handled. Borrows in the common case — the copy only happens when
     /// scaling is actually required.
     pub fn for_upload(&self, max_side: u32) -> (u32, u32, Cow<'_, [u8]>) {
-        let (width, height) = self.size();
-        let Some(scale) = fit_scale(width, height, max_side) else {
-            return (width, height, Cow::Borrowed(self.rgba_bytes()));
-        };
-
-        let target_w = ((width as f64 * scale).round() as u32).max(1);
-        let target_h = ((height as f64 * scale).round() as u32).max(1);
-        let resized = image::imageops::resize(
-            &self.pixels,
-            target_w,
-            target_h,
-            image::imageops::FilterType::Triangle,
-        );
-        (target_w, target_h, Cow::Owned(resized.into_raw()))
+        for_upload(&self.pixels, max_side)
     }
+}
+
+/// Pixels ready to hand to the GPU, downscaled if they are larger than the driver's
+/// texture limit.
+///
+/// Limits are commonly 16384 texels per side; panoramas and large scans exceed that,
+/// and an oversized upload fails outright rather than degrading, so it has to be
+/// handled. Borrows in the common case — the copy only happens when scaling is
+/// actually required.
+///
+/// Free-standing rather than a method, because edited pixels need exactly the same
+/// treatment and they never belonged to a [`Decoded`].
+pub fn for_upload(pixels: &image::RgbaImage, max_side: u32) -> (u32, u32, Cow<'_, [u8]>) {
+    let (width, height) = pixels.dimensions();
+    let Some(scale) = fit_scale(width, height, max_side) else {
+        return (width, height, Cow::Borrowed(pixels.as_raw()));
+    };
+
+    let target_w = ((width as f64 * scale).round() as u32).max(1);
+    let target_h = ((height as f64 * scale).round() as u32).max(1);
+    let resized = image::imageops::resize(
+        pixels,
+        target_w,
+        target_h,
+        image::imageops::FilterType::Triangle,
+    );
+    (target_w, target_h, Cow::Owned(resized.into_raw()))
 }
 
 /// Scale factor needed to bring an image within `max_side`, or `None` if it fits.
@@ -108,7 +143,11 @@ impl std::fmt::Debug for Decoded {
 /// and corrected for EXIF orientation.
 pub fn oriented_dimensions(path: &Path, orientation: Orientation) -> Option<(u32, u32)> {
     let (w, h) = image::image_dimensions(path).ok()?;
-    Some(if orientation.swaps_axes() { (h, w) } else { (w, h) })
+    Some(if orientation.swaps_axes() {
+        (h, w)
+    } else {
+        (w, h)
+    })
 }
 
 /// Try to produce an instant preview from the JPEG thumbnail embedded in EXIF.
@@ -234,7 +273,10 @@ mod tests {
     #[test]
     fn garbage_bytes_are_a_decode_error() {
         let path = temp_path("garbage.png");
-        File::create(&path).unwrap().write_all(b"not an image").unwrap();
+        File::create(&path)
+            .unwrap()
+            .write_all(b"not an image")
+            .unwrap();
 
         assert!(decode_full(&path).is_err());
 
@@ -293,5 +335,13 @@ mod tests {
         assert_eq!(decoded.size(), (8, 8));
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn recognises_supported_extensions_whatever_their_case() {
+        assert!(is_supported(Path::new("holiday.JPG")));
+        assert!(is_supported(Path::new("scan.png")));
+        assert!(!is_supported(Path::new("notes.txt")));
+        assert!(!is_supported(Path::new("no-extension")));
     }
 }

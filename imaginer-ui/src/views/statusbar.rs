@@ -15,9 +15,26 @@ pub struct Status<'a> {
     pub zoom: f32,
     pub file_size: Option<u64>,
     pub error: Option<&'a str>,
+    /// Short-lived confirmation of an action, shown at the far end of the bar.
+    pub notice: Option<&'a str>,
 }
 
 pub fn show(ui: &mut egui::Ui, status: &Status<'_>) {
+    ui.horizontal(|ui| {
+        facts(ui, status);
+
+        // Right-aligned, so it never shifts the facts about the image sideways as
+        // it comes and goes. This has to come last: the layout claims whatever
+        // width is left over.
+        if let Some(notice) = status.notice {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.colored_label(theme::ACCENT_COLOR, notice);
+            });
+        }
+    });
+}
+
+fn facts(ui: &mut egui::Ui, status: &Status<'_>) {
     ui.horizontal(|ui| {
         if let Some(error) = status.error {
             ui.colored_label(ui.visuals().error_fg_color, error);

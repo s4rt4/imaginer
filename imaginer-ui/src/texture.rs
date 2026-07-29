@@ -2,6 +2,7 @@
 
 use eframe::egui;
 use imaginer_core::Decoded;
+use imaginer_core::image::RgbaImage;
 
 /// How image textures are sampled.
 ///
@@ -37,15 +38,33 @@ impl ImageTexture {
 }
 
 pub fn upload(ctx: &egui::Context, name: &str, decoded: &Decoded) -> ImageTexture {
+    // `full_size` rather than the decoded size: a preview is a stand-in for an image
+    // whose real dimensions are already known, and laying it out at its own small
+    // size would make the view jump when the full decode swapped in.
+    upload_sized(ctx, name, &decoded.pixels, decoded.full_size)
+}
+
+/// Upload pixels that are their own source — the output of the edit pipeline, which
+/// has no larger original behind it.
+pub fn upload_pixels(ctx: &egui::Context, name: &str, pixels: &RgbaImage) -> ImageTexture {
+    upload_sized(ctx, name, pixels, pixels.dimensions())
+}
+
+fn upload_sized(
+    ctx: &egui::Context,
+    name: &str,
+    pixels: &RgbaImage,
+    source_size: (u32, u32),
+) -> ImageTexture {
     let max_side = ctx.input(|i| i.max_texture_side) as u32;
-    let (width, height, bytes) = decoded.for_upload(max_side);
+    let (width, height, bytes) = imaginer_core::decode::for_upload(pixels, max_side);
 
     let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &bytes);
 
     ImageTexture {
         handle: ctx.load_texture(name, image, IMAGE_TEXTURE),
         uploaded_size: (width, height),
-        source_size: decoded.full_size,
-        downscaled: (width, height) != decoded.size(),
+        source_size,
+        downscaled: (width, height) != pixels.dimensions(),
     }
 }
