@@ -186,3 +186,10 @@ only the alpha channel is kept (~2KB each) and the colour arrives at draw time f
 the widget's own foreground colour. That is what makes hover, disabled and active
 states free, and it keeps an SVG renderer out of a binary whose whole point is how
 fast it starts.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
+
+The UI icons are [Lucide](https://lucide.dev), also MIT. `chevron-left` and
+`chevron-right` were drawn by hand to match the set.
