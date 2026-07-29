@@ -71,6 +71,20 @@ fn upload(ctx: &egui::Context, icon: Icon) -> egui::TextureHandle {
     )
 }
 
+/// Draw an icon into `rect`, tinted, with no interaction of its own.
+///
+/// For chrome that is not a toolbar button — the canvas chevrons own their hit
+/// area and their own fade, so they need the drawing without the widget around it.
+pub fn paint(ui: &egui::Ui, icons: &mut Icons, icon: Icon, rect: egui::Rect, tint: egui::Color32) {
+    let texture = icons.texture(ui.ctx(), icon);
+    ui.painter().image(
+        texture,
+        rect.round_to_pixels(ui.pixels_per_point()),
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        tint,
+    );
+}
+
 /// An icon button: transparent at rest, filling in only under the pointer.
 ///
 /// Chrome that is quiet until you reach for it is what lets a toolbar sit above a

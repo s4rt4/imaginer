@@ -124,8 +124,9 @@ pub const ACCENT_COLOR: Color32 = ACCENT;
 
 /// Chrome background, for the panels that draw their own frame.
 pub const PANEL_BG: Color32 = BG_PANEL;
+pub const TEXT_PRIMARY: Color32 = TEXT;
 
 /// Colours handed to the window manager for the title bar, so the chrome the shell
 /// draws is the same colour as the toolbar directly below it.
 pub const TITLEBAR_BG: Color32 = BG_PANEL;
-pub const TITLEBAR_TEXT: Color32 = TEXT;
+pub const TITLEBAR_TEXT: Color32 = TEXT_PRIMARY;

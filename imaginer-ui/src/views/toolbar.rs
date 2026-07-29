@@ -19,6 +19,7 @@ pub enum Action {
     CopyPath,
     Delete,
     ToggleFullscreen,
+    ToggleSlideshow,
     ToggleSidebar,
 }
 
@@ -27,6 +28,10 @@ pub enum Action {
 pub struct Bar {
     pub has_image: bool,
     pub fullscreen: bool,
+    pub slideshow: bool,
+    /// Whether there is anywhere to step to, which is what makes a slideshow
+    /// worth offering at all.
+    pub has_neighbours: bool,
     pub sidebar_open: bool,
 }
 
@@ -85,6 +90,18 @@ pub fn show(
             if icons::button(ui, icons, icon, tooltip).clicked() {
                 action = Some(Action::ToggleFullscreen);
             }
+
+            ui.add_enabled_ui(bar.has_neighbours, |ui| {
+                ui.spacing_mut().item_spacing.x = BUTTON_SPACING;
+                let (icon, tooltip) = if bar.slideshow {
+                    (Icon::Pause, "Stop the slideshow (Space)")
+                } else {
+                    (Icon::Play, "Play a slideshow (Space)")
+                };
+                if icons::button(ui, icons, icon, tooltip).clicked() {
+                    action = Some(Action::ToggleSlideshow);
+                }
+            });
         });
 
         separator(ui);

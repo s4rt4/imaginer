@@ -10,6 +10,7 @@ use imaginer_core::image::RgbaImage;
 use imaginer_core::{Edits, Folder, Op, Stage};
 
 use crate::icons::Icons;
+use crate::idle;
 use crate::logo;
 use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
@@ -19,6 +20,9 @@ use crate::{LoadMessage, decode_into, theme, titlebar};
 /// How long a status-bar notice stays up. Long enough to read in passing, short
 /// enough that it never becomes part of the furniture.
 const NOTICE_DURATION: Duration = Duration::from_secs(3);
+
+/// Time each image is held during a slideshow.
+const SLIDE_DURATION: Duration = Duration::from_secs(4);
 
 /// Confirmation of something whose only other evidence is that it worked.
 struct Notice {
@@ -59,6 +63,11 @@ pub struct App {
     /// True while the pipeline is running, which is what keeps frames coming until
     /// the new pixels arrive.
     applying: bool,
+    /// When the slideshow should move on. `None` when it is not running.
+    slideshow: Option<Instant>,
+    /// Set once a frame has been painted, which is when scanning the folder stops
+    /// being something the user is waiting on.
+    painted: bool,
     sidebar_open: bool,
     export: imaginer_core::ExportSettings,
     /// Where the save worker reports back: the file it wrote, or why it could not.
@@ -112,6 +121,8 @@ impl App {
             // until the first edit replaces it with a live one.
             edit_rx: std::sync::mpsc::channel().1,
             applying: false,
+            slideshow: None,
+            painted: false,
             sidebar_open: false,
             export,
             save_rx: std::sync::mpsc::channel().1,
@@ -320,17 +331,19 @@ impl App {
             )
         });
 
-        let (escape, fullscreen, delete, prev, next, rotate, sidebar) = ctx.input_mut(|i| {
-            (
-                i.consume_key(NONE, Key::Escape),
-                i.consume_key(NONE, Key::F11),
-                i.consume_key(NONE, Key::Delete),
-                i.consume_key(NONE, Key::ArrowLeft),
-                i.consume_key(NONE, Key::ArrowRight),
-                i.consume_key(NONE, Key::R),
-                i.consume_key(NONE, Key::E),
-            )
-        });
+        let (escape, fullscreen, delete, prev, next, rotate, sidebar, slideshow) =
+            ctx.input_mut(|i| {
+                (
+                    i.consume_key(NONE, Key::Escape),
+                    i.consume_key(NONE, Key::F11),
+                    i.consume_key(NONE, Key::Delete),
+                    i.consume_key(NONE, Key::ArrowLeft),
+                    i.consume_key(NONE, Key::ArrowRight),
+                    i.consume_key(NONE, Key::R),
+                    i.consume_key(NONE, Key::E),
+                    i.consume_key(NONE, Key::Space),
+                )
+            });
 
         if escape {
             // Escape means "back out of where I am", so it leaves fullscreen
@@ -378,6 +391,9 @@ impl App {
         if sidebar {
             self.sidebar_open = !self.sidebar_open;
         }
+        if slideshow && self.has_neighbours() {
+            self.toggle_slideshow();
+        }
         if undo {
             self.undo(ctx);
         }
@@ -411,6 +427,7 @@ impl App {
             toolbar::Action::CopyPath => self.copy_path(),
             toolbar::Action::Delete => self.delete_current(ctx),
             toolbar::Action::ToggleFullscreen => self.set_fullscreen(ctx, !self.fullscreen),
+            toolbar::Action::ToggleSlideshow => self.toggle_slideshow(),
             toolbar::Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
         }
     }
@@ -631,6 +648,65 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
     }
 
+    /// Whether there is more than one image to move between.
+    ///
+    /// `false` while the listing is still unbuilt, which is only ever the first
+    /// frame — chrome that offers to step somewhere there is nowhere to step is
+    /// worse than chrome that appears a frame late.
+    fn has_neighbours(&self) -> bool {
+        self.folder.as_ref().is_some_and(|folder| folder.len() > 1)
+    }
+
+    fn toggle_slideshow(&mut self) {
+        self.slideshow = match self.slideshow {
+            Some(_) => None,
+            None => Some(Instant::now() + SLIDE_DURATION),
+        };
+    }
+
+    /// Advance the slideshow when its time is up, and keep frames coming until it is.
+    fn tick_slideshow(&mut self, ctx: &egui::Context) {
+        let Some(due) = self.slideshow else {
+            return;
+        };
+
+        let now = Instant::now();
+        if now < due {
+            ctx.request_repaint_after(due - now);
+            return;
+        }
+
+        self.slideshow = Some(now + SLIDE_DURATION);
+        self.step(ctx, true);
+    }
+
+    /// Stop the slideshow the moment the user does anything deliberate.
+    ///
+    /// Keys and the scroll wheel, not pointer movement: a slideshow that stopped
+    /// because the mouse was nudged would be unusable. Space is the exception,
+    /// because it is the key that toggles the thing — letting it count as an
+    /// interruption would stop the slideshow here and immediately restart it in the
+    /// shortcut handler a few lines later.
+    fn interrupt_slideshow(&mut self, ctx: &egui::Context) {
+        if self.slideshow.is_none() {
+            return;
+        }
+
+        let interrupted = ctx.input(|i| {
+            i.smooth_scroll_delta != egui::Vec2::ZERO
+                || i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key { key, pressed: true, .. } if *key != egui::Key::Space
+                    )
+                })
+        });
+
+        if interrupted {
+            self.slideshow = None;
+        }
+    }
+
     fn notify(&mut self, text: impl Into<String>) {
         self.error = None;
         self.notice = Some(Notice {
@@ -686,45 +762,63 @@ impl eframe::App for App {
         }
 
         self.tick_notice(&ctx);
+        // Before the shortcut handler, which consumes the very key presses that
+        // ought to stop a slideshow.
+        self.interrupt_slideshow(&ctx);
         self.handle_dropped_files(&ctx);
         self.handle_shortcuts(&ctx);
+        self.tick_slideshow(&ctx);
+
+        // Fullscreen means the photograph, not a photograph with a toolbar over it.
+        // The chrome comes back the moment the pointer moves.
+        let chrome = idle::opacity(&ctx);
+        let show_chrome = !self.fullscreen || chrome > 0.0;
 
         let base_frame = egui::Frame::side_top_panel(ui.style());
         let toolbar_frame = base_frame.inner_margin(egui::Margin::symmetric(10, 7));
         let status_frame = base_frame.inner_margin(egui::Margin::symmetric(10, 5));
 
-        let mut requested = None;
-        egui::Panel::top(egui::Id::new("toolbar"))
-            .frame(toolbar_frame)
-            .show(ui, |ui| {
-                requested = toolbar::show(
-                    ui,
-                    &mut self.icons,
-                    &mut self.view,
-                    toolbar::Bar {
-                        has_image: self.texture.is_some(),
-                        fullscreen: self.fullscreen,
-                        sidebar_open: self.sidebar_open,
-                    },
-                );
-            });
+        // Read before the panels borrow `self.icons`: it is a method, so it borrows
+        // all of `self`, which a disjoint field access would not.
+        let has_neighbours = self.has_neighbours();
 
-        egui::Panel::bottom(egui::Id::new("status"))
-            .frame(status_frame)
-            .show(ui, |ui| {
-                statusbar::show(
-                    ui,
-                    &statusbar::Status {
-                        path: self.path.as_deref(),
-                        texture: self.texture.as_ref(),
-                        stage: self.stage,
-                        zoom: self.last_zoom,
-                        file_size: self.file_size,
-                        error: self.error.as_deref(),
-                        notice: self.notice.as_ref().map(|n| n.text.as_str()),
-                    },
-                );
-            });
+        let mut requested = None;
+        if show_chrome {
+            egui::Panel::top(egui::Id::new("toolbar"))
+                .frame(toolbar_frame)
+                .show(ui, |ui| {
+                    requested = toolbar::show(
+                        ui,
+                        &mut self.icons,
+                        &mut self.view,
+                        toolbar::Bar {
+                            has_image: self.texture.is_some(),
+                            fullscreen: self.fullscreen,
+                            slideshow: self.slideshow.is_some(),
+                            has_neighbours,
+                            sidebar_open: self.sidebar_open,
+                        },
+                    );
+                });
+
+            egui::Panel::bottom(egui::Id::new("status"))
+                .frame(status_frame)
+                .show(ui, |ui| {
+                    statusbar::show(
+                        ui,
+                        &statusbar::Status {
+                            path: self.path.as_deref(),
+                            texture: self.texture.as_ref(),
+                            stage: self.stage,
+                            zoom: self.last_zoom,
+                            file_size: self.file_size,
+                            position: self.folder.as_ref().and_then(Folder::position),
+                            error: self.error.as_deref(),
+                            notice: self.notice.as_ref().map(|n| n.text.as_str()),
+                        },
+                    );
+                });
+        }
 
         // After the top and bottom panels so it sits between them, and before the
         // central panel so the canvas gets whatever is left.
@@ -755,11 +849,16 @@ impl eframe::App for App {
                 });
         }
 
+        let mut requested_step = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::CANVAS_BG))
             .show(ui, |ui| {
                 if let Some(texture) = self.texture.as_ref() {
+                    let canvas = ui.max_rect();
                     self.last_zoom = viewer::show(ui, texture, &mut self.view);
+                    if has_neighbours {
+                        requested_step = viewer::chevrons(ui, &mut self.icons, canvas, chrome);
+                    }
                     self.trace.mark_first_image();
                 } else {
                     let logotype = self
@@ -778,8 +877,24 @@ impl eframe::App for App {
         if let Some(action) = sidebar_action {
             self.apply_sidebar(&ctx, action);
         }
+        if let Some(step) = requested_step {
+            self.step(&ctx, step == viewer::Step::Next);
+        }
 
         self.trace.mark_first_frame();
+
+        // Scan the folder once something is on screen. Doing it during startup would
+        // put a directory walk on the critical path of an app whose whole point is
+        // how fast it starts; doing it here costs a few milliseconds nobody is
+        // waiting on, and means the position counter and the chevrons are there from
+        // the second frame rather than from the first arrow key.
+        if !self.painted {
+            self.painted = true;
+            if self.path.is_some() {
+                self.folder();
+                ctx.request_repaint();
+            }
+        }
 
         // Benchmark mode: leave as soon as there is something to measure.
         if self.trace.should_exit_after_first_frame()

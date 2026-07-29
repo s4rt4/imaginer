@@ -4,6 +4,7 @@
 
 mod app;
 mod icons;
+mod idle;
 mod logo;
 mod startup;
 mod texture;

@@ -1,7 +1,8 @@
-//! The main canvas: pan, zoom, and view rotation.
+//! The main canvas: pan, zoom, and the navigation chevrons that float over it.
 
 use eframe::egui;
 
+use crate::icons::{self, Icon, Icons};
 use crate::texture::ImageTexture;
 use crate::theme;
 
@@ -121,6 +122,89 @@ pub fn show(ui: &mut egui::Ui, texture: &ImageTexture, state: &mut ViewState) ->
     );
 
     zoom
+}
+
+/// Which way a canvas chevron was asking to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Prev,
+    Next,
+}
+
+/// Radius of a chevron's disc, which is also its hit target.
+const CHEVRON_RADIUS: f32 = 21.0;
+
+/// Gap between the disc and the edge of the canvas.
+const CHEVRON_INSET: f32 = 14.0;
+
+/// Drawn size of the arrow inside the disc.
+const CHEVRON_ICON: f32 = 22.0;
+
+/// Floating previous/next affordances at the canvas edges.
+///
+/// Here rather than in the toolbar because stepping through a folder is the single
+/// most repeated action in a viewer, so it belongs where the eye already is — and
+/// keeping it off the toolbar is precisely what lets that row stay short enough to
+/// read at a glance. They fade with the pointer so that looking at a photograph is
+/// not looking at two buttons on top of it.
+pub fn chevrons(
+    ui: &mut egui::Ui,
+    icons: &mut Icons,
+    canvas: egui::Rect,
+    opacity: f32,
+) -> Option<Step> {
+    let middle = canvas.center().y;
+    let offset = CHEVRON_INSET + CHEVRON_RADIUS;
+    let sides = [
+        (Step::Prev, Icon::ChevronLeft, canvas.left() + offset),
+        (Step::Next, Icon::ChevronRight, canvas.right() - offset),
+    ];
+    let disc = |x: f32| {
+        egui::Rect::from_center_size(
+            egui::pos2(x, middle),
+            egui::Vec2::splat(CHEVRON_RADIUS * 2.0),
+        )
+    };
+
+    // A pointer resting on a chevron holds it open. Without this it fades out from
+    // under the cursor, and the thing you were about to click stops existing.
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    let held_open = pointer.is_some_and(|at| sides.iter().any(|(_, _, x)| disc(*x).contains(at)));
+    let opacity = if held_open { 1.0 } else { opacity };
+
+    // Nothing is drawn when they are invisible, and nothing is claimed either:
+    // an invisible chevron that still swallowed clicks would break panning near
+    // the edges of the image.
+    if opacity <= 0.0 {
+        return None;
+    }
+
+    let mut step = None;
+    for (direction, icon, x) in sides {
+        let rect = disc(x);
+        let response = ui.interact(rect, ui.id().with(direction as u8), egui::Sense::click());
+
+        let backdrop = if response.hovered() {
+            theme::PANEL_BG.gamma_multiply(0.92 * opacity)
+        } else {
+            theme::PANEL_BG.gamma_multiply(0.66 * opacity)
+        };
+        ui.painter()
+            .circle_filled(rect.center(), CHEVRON_RADIUS, backdrop);
+        icons::paint(
+            ui,
+            icons,
+            icon,
+            egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(CHEVRON_ICON)),
+            theme::TEXT_PRIMARY.gamma_multiply(opacity),
+        );
+
+        if response.clicked() {
+            step = Some(direction);
+        }
+    }
+
+    step
 }
 
 /// Keep at least a sliver of the image on screen.

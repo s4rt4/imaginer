@@ -14,6 +14,8 @@ pub struct Status<'a> {
     pub stage: Option<Stage>,
     pub zoom: f32,
     pub file_size: Option<u64>,
+    /// Where this image sits in its folder, 1-based, as `(position, total)`.
+    pub position: Option<(usize, usize)>,
     pub error: Option<&'a str>,
     /// Short-lived confirmation of an action, shown at the far end of the bar.
     pub notice: Option<&'a str>,
@@ -47,6 +49,12 @@ fn facts(ui: &mut egui::Ui, status: &Status<'_>) {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "No image".to_owned());
         ui.label(name);
+
+        // Directly after the name, because it answers a question about the name:
+        // which of these am I looking at, and how many are left.
+        if let Some((at, total)) = status.position {
+            ui.colored_label(theme::TEXT_MUTED, format!("{at} / {total}"));
+        }
 
         let Some(texture) = status.texture else {
             return;

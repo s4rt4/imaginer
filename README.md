@@ -17,7 +17,12 @@ Usable as a daily viewer, with light editing. What works today:
   swaps in behind it
 - Pan, zoom (scroll wheel, anchored at the cursor), fit-to-window
 - Oversized images downscaled to the GPU's texture limit rather than failing
-- Next/previous through the containing folder, fullscreen, dark window chrome
+- Next/previous through the containing folder, from the arrow keys or from
+  chevrons that fade in over the canvas and out again when the pointer goes still
+- Fullscreen, where the toolbar and status bar get out of the way once you stop
+  moving — otherwise "fullscreen" only means "big window"
+- Slideshow over the folder; any keypress stops it
+- Dark window chrome, coloured to match the toolbar rather than the shell's grey
 
 **Editing** — non-destructive; the original is only ever read
 
@@ -31,7 +36,7 @@ Usable as a daily viewer, with light editing. What works today:
 - Copy the file path, or send the file to the Recycle Bin — never `fs::remove_file`
 - Startup benchmark harness
 
-Not yet: crop, colour adjustment, slideshow, filmstrip, prefetch and cache.
+Not yet: crop, colour adjustment, filmstrip, prefetch and cache.
 
 ## Build and run
 
@@ -50,6 +55,7 @@ cargo run --release -- "C:\path\to\image.jpg"
 | `+` / `-` | Zoom |
 | Double-click | Toggle fit / 100% |
 | `F11` | Fullscreen |
+| `Space` | Start or stop the slideshow |
 | `E` | Toggle the edit sidebar |
 | `R` | Rotate 90° clockwise |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
