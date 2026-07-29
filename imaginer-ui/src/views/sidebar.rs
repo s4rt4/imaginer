@@ -297,14 +297,27 @@ fn export(ui: &mut egui::Ui, state: &mut State<'_>) -> Option<Action> {
             );
         }
 
-        ui.add_space(6.0);
-        ui.add(
-            egui::Slider::new(&mut state.settings.scale_percent, 5..=200)
-                .text("Scale %")
-                .clamping(egui::SliderClamping::Always),
-        );
+        // An icon's sizes come from the format, so there is nothing to scale — and
+        // a slider that silently did nothing would be worse than its absence.
+        if state.settings.format.has_fixed_sizes() {
+            ui.add_space(6.0);
+            ui.colored_label(
+                theme::TEXT_MUTED,
+                "16 – 256 px, every size Windows asks for",
+            );
+        } else {
+            ui.add_space(6.0);
+            ui.add(
+                egui::Slider::new(&mut state.settings.scale_percent, 5..=200)
+                    .text("Scale %")
+                    .clamping(egui::SliderClamping::Always),
+            );
+        }
 
-        if let Some(size) = state.edited_size {
+        if let Some(size) = state
+            .edited_size
+            .filter(|_| !state.settings.format.has_fixed_sizes())
+        {
             let (w, h) = state.settings.size_after(size);
             ui.add_space(2.0);
             ui.colored_label(theme::TEXT_MUTED, format!("{w} × {h} px"));

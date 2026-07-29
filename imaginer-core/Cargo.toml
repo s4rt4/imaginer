@@ -12,6 +12,7 @@ license.workspace = true
 # (ravif), OpenEXR, TIFF and more — a large build-time and binary-size cost for
 # formats we do not ship yet. Add features here as phases land.
 image = { version = "0.25.10", default-features = false, features = [
+    "ico",
     "png",
     "jpeg",
     "gif",
@@ -20,3 +21,8 @@ image = { version = "0.25.10", default-features = false, features = [
 ] }
 kamadak-exif = "0.6.1"
 thiserror = "2.0.19"
+
+# libwebp, for lossy WebP with a quality setting. `image` cannot encode WebP at all
+# and `image-webp` is lossless-only, and lossless defeats the point: the reason to
+# write WebP here is a smaller file for the web.
+webp = "0.3.1"
