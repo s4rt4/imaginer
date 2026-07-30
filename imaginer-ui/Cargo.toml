@@ -40,12 +40,20 @@ trash = "5.2.6"
 raw-window-handle = "0.6.2"
 
 [target.'cfg(windows)'.dependencies]
-# `DwmSetWindowAttribute` for the dark title bar, and the console functions that let
+# `DwmSetWindowAttribute` for the dark title bar; the console functions that let
 # `--convert` print to the terminal that launched it despite this being a
-# GUI-subsystem binary.
+# GUI-subsystem binary; and named pipes, which is how the processes Explorer starts
+# for a multi-select elect one of themselves to do the conversion.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Graphics_Dwm",
+    # `Win32_Security` and `Win32_System_IO` are here only because the pipe
+    # functions name `SECURITY_ATTRIBUTES` and `OVERLAPPED` in their signatures —
+    # we pass null for both.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
 ] }
 
 [build-dependencies]

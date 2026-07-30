@@ -6,6 +6,7 @@
 //!
 //!   --quality <1-100>   for the lossy formats; ignored by the others
 //!   --out <directory>   skip the folder dialog, for scripts and benchmarks
+//!   --collect           merge with sibling processes started at the same time
 //! ```
 //!
 //! The conversion path never constructs an eframe window: it decodes, encodes and
@@ -21,6 +22,8 @@ use std::process::ExitCode;
 
 use imaginer_core::convert::{self, Outcome};
 use imaginer_core::{ExportSettings, Format};
+
+use crate::collector;
 
 /// What the arguments asked for.
 #[derive(Debug)]
@@ -38,6 +41,13 @@ pub struct Request {
     /// menu will hit.
     pub out_dir: Option<PathBuf>,
     pub files: Vec<PathBuf>,
+    /// Whether to merge with sibling processes before converting.
+    ///
+    /// Only the shell integration sets this: Explorer launches a classic verb once
+    /// per selected file, and the batch has to be reassembled. A conversion typed
+    /// at a prompt already has every file on its command line, and would only be
+    /// paying half a second to discover that.
+    pub collect: bool,
 }
 
 /// Read the process arguments.
@@ -51,6 +61,7 @@ pub fn parse(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Launc
     let mut format = None;
     let mut quality = None;
     let mut out_dir = None;
+    let mut collect = false;
     let mut files = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -84,6 +95,7 @@ pub fn parse(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Launc
                 let dir = args.next().ok_or("--out needs a directory")?;
                 out_dir = Some(PathBuf::from(dir));
             }
+            Some("--collect") => collect = true,
             Some(other) if other.starts_with("--") => {
                 return Err(format!("unknown option {other}"));
             }
@@ -107,16 +119,28 @@ pub fn parse(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Launc
         quality: quality.unwrap_or(ExportSettings::default().quality),
         out_dir,
         files,
+        collect,
     }))
 }
 
 /// Convert, report, and produce the process exit code.
-pub fn run(request: Request) -> ExitCode {
+pub fn run(mut request: Request) -> ExitCode {
     let settings = ExportSettings {
         format: request.format,
         quality: request.quality,
         scale_percent: 100,
     };
+
+    // Gathering comes before the dialog, so the one folder question covers the whole
+    // selection rather than the first file of it.
+    if request.collect {
+        match collector::join(&batch_key(&request), std::mem::take(&mut request.files)) {
+            collector::Role::Collector(files) => request.files = files,
+            // Another process owns this batch and now has our paths. Exiting quietly
+            // is the entire contribution.
+            collector::Role::HandedOver => return ExitCode::SUCCESS,
+        }
+    }
 
     let Some(directory) = destination_directory(&request) else {
         // The folder dialog was dismissed. Cancelling is not an error, and saying
@@ -155,6 +179,15 @@ pub fn run(request: Request) -> ExitCode {
     );
 
     report(&outcomes, &directory)
+}
+
+/// What makes two processes part of the same batch.
+///
+/// Format and quality, because those are the whole of what the verb decided. Two
+/// menu picks in quick succession — WebP for one selection, ICO for another — must
+/// not merge into one conversion, and they would if the key were fixed.
+fn batch_key(request: &Request) -> String {
+    format!("{}-{}", request.format.extension(), request.quality)
 }
 
 /// Where to write: what `--out` said, or whatever the folder dialog returns.
