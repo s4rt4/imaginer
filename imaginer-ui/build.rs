@@ -15,6 +15,14 @@ use resvg::{tiny_skia, usvg};
 /// a full 256px buffer.
 const ICON_SIZE: u32 = 128;
 
+/// Edge of the raster the executable's icon resource is built from.
+///
+/// 256 because that is the largest entry an `.ico` can hold and what the shell's
+/// preview pane asks for. Rendered separately from [`ICON_SIZE`] rather than
+/// sharing it: this one is written to a file at build time and never loaded at
+/// runtime, so it costs nothing to make it as large as the format allows.
+const APP_ICON_SIZE: u32 = 256;
+
 /// Logotype width, in pixels. Drawn at roughly half this size, so the extra pixels
 /// are headroom for high-DPI displays rather than waste.
 const LOGOTYPE_WIDTH: u32 = 384;
@@ -51,6 +59,61 @@ fn main() {
     .expect("failed to write logo dimensions");
 
     rasterise_ui_icons(&assets.join("icons"), &out_dir);
+    embed_executable_icon(&assets.join("imaginer_logoicon.svg"), &out_dir);
+}
+
+/// Attach the logo to the executable as a Win32 icon resource.
+///
+/// This is not the same thing as the window icon set through eframe, and one does
+/// not stand in for the other: the runtime icon is handed to the window manager
+/// after the process starts, so Explorer, shortcuts, the taskbar's pinned entry and
+/// anything reading `"imaginer.exe,0"` — the shell verbs in
+/// `scripts/install-shell-integration.ps1` among them — all see nothing without it.
+///
+/// The `.ico` is written here by the crate's own encoder rather than committed as a
+/// binary asset, which keeps the SVG the single source of truth and means the icon
+/// Explorer draws comes off exactly the code path the Convert menu writes files
+/// with.
+fn embed_executable_icon(svg_path: &Path, out_dir: &Path) {
+    // Build scripts run on the host, so the host's own `cfg` says nothing about what
+    // is being built. Only a Windows target has resources to attach.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    let raster = render(svg_path, APP_ICON_SIZE);
+    let pixels =
+        imaginer_core::image::RgbaImage::from_raw(raster.width, raster.height, raster.rgba)
+            .expect("the rasterised icon is RGBA8 and its buffer matches its dimensions");
+
+    let ico = out_dir.join("imaginer.ico");
+    imaginer_core::export::write(
+        &pixels,
+        &ico,
+        &imaginer_core::ExportSettings {
+            format: imaginer_core::Format::Ico,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|err| panic!("failed to write the executable icon: {err}"));
+
+    #[cfg(windows)]
+    winresource::WindowsResource::new()
+        .set_icon(ico.to_str().expect("OUT_DIR is valid UTF-8"))
+        // Without these the resource carries the crate name, so Explorer's
+        // properties pane and the "Open with" list both offer "imaginer-ui".
+        .set("ProductName", "Imaginer")
+        .set("FileDescription", "Imaginer — image viewer and converter")
+        .set("OriginalFilename", "imaginer.exe")
+        .set("LegalCopyright", "MIT licensed — see LICENSE")
+        .compile()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to compile the icon resource: {err}\n\
+                 This needs rc.exe from the Windows SDK, which ships with the MSVC \
+                 toolchain this crate already builds under."
+            )
+        });
 }
 
 /// Rasterise every icon in `dir` into one packed blob of alpha masks, plus the

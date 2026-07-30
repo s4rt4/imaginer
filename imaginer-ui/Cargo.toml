@@ -62,6 +62,18 @@ windows-sys = { version = "0.61.2", features = [
 # fontdb and its font enumeration from the build entirely.
 resvg = { version = "0.47", default-features = false }
 
+# The `.ico` embedded as the executable's Win32 icon resource is written by our own
+# encoder rather than a second one kept in step by hand -- the SVG stays the single
+# source of truth, and the icon Explorer shows is the same code path the Convert
+# menu produces files with.
+imaginer-core = { path = "../imaginer-core" }
+
+[target.'cfg(windows)'.build-dependencies]
+# Drives the Windows SDK resource compiler, which is the only way to attach an icon
+# to the executable itself. The runtime window icon is a separate thing entirely and
+# does nothing for Explorer, shortcuts, or the shell's own menus.
+winresource = "0.1"
+
 [features]
 default = []
 # Compiles the wgpu backend alongside glow so `IMAGINER_RENDERER=wgpu` can be
