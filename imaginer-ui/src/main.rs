@@ -3,6 +3,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cli;
+mod console;
 mod icons;
 mod idle;
 mod logo;
@@ -13,6 +15,7 @@ mod titlebar;
 mod views;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -24,8 +27,31 @@ pub enum LoadMessage {
     Failed(String),
 }
 
-fn main() -> eframe::Result {
+fn main() -> ExitCode {
     let launched_at = Instant::now();
+
+    // Reading the arguments has to come first, because they decide whether a window
+    // is wanted at all — `--convert` must not pay for one. It costs microseconds
+    // over the `args_os().nth(1)` this replaced, so the decode spawn below is still
+    // effectively the first thing that happens on a viewer launch.
+    let launch = match cli::parse(std::env::args_os()) {
+        Ok(launch) => launch,
+        Err(message) => {
+            console::attach_to_parent();
+            return cli::report_usage_error(&message);
+        }
+    };
+
+    let path = match launch {
+        cli::Launch::Convert(request) => {
+            // Borrow the launching terminal's console, if there is one, so the
+            // per-file report is visible. From Explorer there is none and the run
+            // stays silent unless something fails.
+            console::attach_to_parent();
+            return cli::run(request);
+        }
+        cli::Launch::Viewer(path) => path,
+    };
 
     // Everything below this point is deliberate ordering, not style.
     //
@@ -34,7 +60,6 @@ fn main() -> eframe::Result {
     // means the image is usually ready by the time we paint the first frame, so
     // there is no empty window and no spinner. Anything added to `main` above this
     // spawn directly delays the image appearing.
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
     let (tx, rx) = mpsc::channel();
     if let Some(path) = path.clone() {
         std::thread::Builder::new()
@@ -71,11 +96,18 @@ fn main() -> eframe::Result {
     // driver, with no code of ours running in it.
     trace.mark("run_native");
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Imaginer",
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, trace, path, rx)))),
-    )
+    );
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        // The window never opened, so there is nothing on screen to carry the
+        // message and a GUI-subsystem build has no console either.
+        Err(err) => cli::report_usage_error(&format!("could not start: {err}")),
+    }
 }
 
 /// Which renderer to ask eframe for.

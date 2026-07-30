@@ -40,8 +40,13 @@ trash = "5.2.6"
 raw-window-handle = "0.6.2"
 
 [target.'cfg(windows)'.dependencies]
-# Only for `DwmSetWindowAttribute`, which is what makes the title bar dark.
-windows-sys = { version = "0.61.2", features = ["Win32_Graphics_Dwm"] }
+# `DwmSetWindowAttribute` for the dark title bar, and the console functions that let
+# `--convert` print to the terminal that launched it despite this being a
+# GUI-subsystem binary.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Graphics_Dwm",
+    "Win32_System_Console",
+] }
 
 [build-dependencies]
 # Rasterises the logo SVGs at build time so the shipping binary carries pixels, not
