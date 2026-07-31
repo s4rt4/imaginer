@@ -9,6 +9,7 @@ mod console;
 mod icons;
 mod idle;
 mod logo;
+mod prefetch;
 mod startup;
 mod texture;
 mod theme;

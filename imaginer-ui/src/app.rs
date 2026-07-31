@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use imaginer_core::image::RgbaImage;
-use imaginer_core::{Edits, Folder, Op, Stage};
+use imaginer_core::{Decoded, Edits, Folder, Op, Stage, Stamp};
 
 use crate::icons::Icons;
 use crate::idle;
 use crate::logo;
+use crate::prefetch::Prefetcher;
 use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
 use crate::views::crop::CropState;
@@ -25,10 +26,63 @@ const NOTICE_DURATION: Duration = Duration::from_secs(3);
 /// Time each image is held during a slideshow.
 const SLIDE_DURATION: Duration = Duration::from_secs(4);
 
+/// How far either side of the current image to decode ahead.
+///
+/// One. Two would cover a second keypress arriving before the first prefetch
+/// finished, but it also doubles the work thrown away every time the user changes
+/// direction — and the image that matters, the very next one, would be finished no
+/// sooner for it.
+const PREFETCH_RADIUS: usize = 1;
+
 /// Confirmation of something whose only other evidence is that it worked.
 struct Notice {
     text: String,
     expires_at: Instant,
+}
+
+/// Measurement of the action a folder session repeats most.
+///
+/// `IMAGINER_TRACE_NAV=1` prints a line per image shown — how long it took to reach
+/// the screen, and whether the pixels came from the cache. Prefetch is only worth a
+/// thread and 512MB if those two numbers are far apart, and this is what says whether
+/// they are. Same idiom as the startup trace: off unless asked for, and reported by
+/// the shipping binary rather than a special build.
+struct NavTrace {
+    enabled: bool,
+    asked_at: Instant,
+    from_cache: bool,
+}
+
+impl NavTrace {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("IMAGINER_TRACE_NAV").is_some_and(|v| v != "0"),
+            asked_at: Instant::now(),
+            from_cache: false,
+        }
+    }
+
+    /// An image has been asked for. Starts the clock.
+    fn asked(&mut self, from_cache: bool) {
+        self.asked_at = Instant::now();
+        self.from_cache = from_cache;
+    }
+
+    /// Full-resolution pixels are on screen. Reports what the wait was.
+    fn arrived(&self, path: Option<&Path>) {
+        if !self.enabled {
+            return;
+        }
+        let name = path
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let source = if self.from_cache { "cached" } else { "decoded" };
+        eprintln!(
+            "nav: {name} {source} {:.1}ms",
+            self.asked_at.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 }
 
 pub struct App {
@@ -40,7 +94,10 @@ pub struct App {
     error: Option<String>,
     notice: Option<Notice>,
     view: viewer::ViewState,
-    file_size: Option<u64>,
+    /// What the current file looked like on disk when it was opened. Carries the
+    /// size the status bar shows, and is what the cache is keyed on — so an image
+    /// saved over is re-decoded rather than served from before the save.
+    stamp: Option<Stamp>,
     /// True while a decode is in flight, which is also what drives repainting.
     loading: bool,
     /// Bumped per load so each texture gets a distinct name in egui's texture manager.
@@ -54,8 +111,9 @@ pub struct App {
     /// launch that only ever looks at the image it was given should not pay for it.
     folder: Option<Folder>,
     /// The pixels exactly as decoded, kept so every edit runs from the original
-    /// rather than compounding on already-edited output. Shared with the worker
-    /// thread, which is the only reason it is behind an `Arc`.
+    /// rather than compounding on already-edited output. Behind an `Arc` because it
+    /// is shared: with the edit worker, and with the cache entry it came from — so
+    /// an image evicted while it is still on screen costs nothing to keep showing.
     source: Option<Arc<RgbaImage>>,
     edits: Edits,
     /// Results from the edit worker. Replaced per run, so a stale result from a
@@ -86,6 +144,10 @@ pub struct App {
     /// never pays for it.
     logotype: Option<egui::TextureHandle>,
     icons: Icons,
+    /// Decoded images kept around, and the thread that decodes the ones nobody has
+    /// asked for yet.
+    prefetch: Prefetcher,
+    nav: NavTrace,
 }
 
 impl App {
@@ -111,7 +173,7 @@ impl App {
 
         Self {
             trace,
-            file_size: path.as_deref().and_then(file_size),
+            stamp: path.as_deref().and_then(Stamp::of),
             loading: path.is_some(),
             path,
             rx,
@@ -142,14 +204,22 @@ impl App {
             trimming: false,
             logotype: None,
             icons: Icons::default(),
+            prefetch: Prefetcher::with_budget(cache_budget()),
+            nav: NavTrace::new(),
         }
     }
 
-    /// Open a file the user picked, and forget the folder listing so it is rebuilt
-    /// around the new location the next time navigation needs it.
+    /// Open a file the user picked, from somewhere the folder listing may not cover.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.folder = None;
         self.show(ctx, path);
+
+        // Rescanned straight away rather than left for the first arrow key. The scan
+        // is kept off the *startup* path, which this is not — and prefetch cannot
+        // warm neighbours nobody has told it about, so deferring it would mean the
+        // first step after every Open was the slow kind.
+        self.folder();
+        self.warm_neighbours();
     }
 
     /// The images beside the current one, scanned on first use.
@@ -183,12 +253,11 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = rx;
 
-        self.file_size = file_size(&path);
+        self.stamp = Stamp::of(&path);
         self.path = Some(path.clone());
         self.stage = None;
         self.error = None;
         self.notice = None;
-        self.loading = true;
         self.texture_generation += 1;
 
         // The outgoing image stays up until its replacement is ready. Clearing it
@@ -207,40 +276,85 @@ impl App {
 
         self.export = export_defaults(Some(&path));
 
-        std::thread::Builder::new()
-            .name("decode".to_owned())
-            .spawn(move || decode_into(path, &tx))
-            .expect("failed to spawn decode thread");
+        // Prefetched or stepped back to, this image may already be decoded — in
+        // which case it goes up in this very frame. No thread, no second frame, and
+        // none of the wait that makes walking a folder feel slow.
+        let ready = self
+            .stamp
+            .as_ref()
+            .and_then(|stamp| self.prefetch.cached(&path, stamp));
+
+        self.nav.asked(ready.is_some());
+
+        match ready {
+            Some(decoded) => self.accept(ctx, decoded),
+            None => {
+                self.loading = true;
+                std::thread::Builder::new()
+                    .name("decode".to_owned())
+                    .spawn(move || decode_into(path, &tx))
+                    .expect("failed to spawn decode thread");
+            }
+        }
+
+        // After the image itself is under way, never before: the neighbours are the
+        // one thing here nobody is waiting on.
+        self.warm_neighbours();
 
         ctx.request_repaint();
+    }
+
+    /// Ask the prefetch thread to decode the images either side of this one.
+    ///
+    /// Silently does nothing while the folder listing is still unbuilt, which is only
+    /// ever the first frame — the scan is deliberately off the startup path, and
+    /// forcing it here to warm a neighbour would put it back on.
+    fn warm_neighbours(&self) {
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        self.prefetch.request(folder.neighbours(PREFETCH_RADIUS));
+    }
+
+    /// Put decoded pixels on screen, and keep them for the next time this image is
+    /// asked for.
+    fn accept(&mut self, ctx: &egui::Context, decoded: Decoded) {
+        let name = format!("image-{}", self.texture_generation);
+        let stage = decoded.stage;
+        self.stage = Some(stage);
+        self.texture = Some(texture::upload(ctx, &name, &decoded));
+        self.error = None;
+
+        // Fit the new image, once. Not on the full decode that follows a preview,
+        // which would throw away a zoom set while it loaded.
+        if self.awaiting_first_frame {
+            self.awaiting_first_frame = false;
+            self.view.reset();
+        }
+        // A preview means the full decode is still coming — and a full one means
+        // nothing is, whether it arrived on a thread or straight from the cache.
+        self.loading = stage == Stage::Preview;
+
+        // Editing needs the real pixels; a thumbnail stand-in would produce a
+        // preview at the wrong resolution and an export at the wrong one entirely.
+        if stage == Stage::Full {
+            self.nav.arrived(self.path.as_deref());
+            self.source = Some(Arc::clone(&decoded.pixels));
+
+            // Into the cache as well, so stepping back to it is as free as stepping
+            // forward. Re-storing something that came from there is not wasted: it
+            // renews the entry, which is what stops the image on screen being the
+            // next one evicted.
+            if let (Some(path), Some(stamp)) = (self.path.clone(), self.stamp.clone()) {
+                self.prefetch.store(path, stamp, decoded);
+            }
+        }
     }
 
     fn poll_decode(&mut self, ctx: &egui::Context) {
         loop {
             match self.rx.try_recv() {
-                Ok(LoadMessage::Loaded(decoded)) => {
-                    let name = format!("image-{}", self.texture_generation);
-                    let stage = decoded.stage;
-                    self.stage = Some(stage);
-                    self.texture = Some(texture::upload(ctx, &name, &decoded));
-                    self.error = None;
-
-                    // Fit the new image, once. Not on the full decode that follows a
-                    // preview, which would throw away a zoom set while it loaded.
-                    if self.awaiting_first_frame {
-                        self.awaiting_first_frame = false;
-                        self.view.reset();
-                    }
-                    // A preview means the full decode is still coming.
-                    self.loading = stage == Stage::Preview;
-
-                    // Editing needs the real pixels; a thumbnail stand-in would
-                    // produce a preview at the wrong resolution and an export at
-                    // the wrong one entirely.
-                    if stage == Stage::Full {
-                        self.source = Some(Arc::new(decoded.pixels));
-                    }
-                }
+                Ok(LoadMessage::Loaded(decoded)) => self.accept(ctx, decoded),
                 Ok(LoadMessage::Failed(message)) => {
                     self.error = Some(message);
                     self.loading = false;
@@ -782,6 +896,11 @@ impl App {
             return;
         }
 
+        // Hand the budget back. The stamp check would refuse to serve these pixels
+        // anyway, but only once somebody asked — and nobody will, because the file
+        // is gone. Left alone they would sit there evicting images that still exist.
+        self.prefetch.forget(&path);
+
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -795,7 +914,7 @@ impl App {
                 self.path = None;
                 self.texture = None;
                 self.stage = None;
-                self.file_size = None;
+                self.stamp = None;
                 self.loading = false;
                 self.view.reset();
             }
@@ -976,7 +1095,7 @@ impl eframe::App for App {
                             texture: self.texture.as_ref(),
                             stage: self.stage,
                             zoom: self.last_zoom,
-                            file_size: self.file_size,
+                            file_size: self.stamp.as_ref().map(Stamp::file_size),
                             position: self.folder.as_ref().and_then(Folder::position),
                             error: self.error.as_deref(),
                             notice: self.notice.as_ref().map(|n| n.text.as_str()),
@@ -1071,6 +1190,9 @@ impl eframe::App for App {
             self.painted = true;
             if self.path.is_some() {
                 self.folder();
+                // Only now can prefetch know what the neighbours are. `show` asked
+                // while the listing was still unbuilt and was told nothing.
+                self.warm_neighbours();
                 ctx.request_repaint();
             }
         }
@@ -1119,8 +1241,19 @@ fn empty_state(ui: &mut egui::Ui, logotype: &egui::TextureHandle, error: Option<
     });
 }
 
-fn file_size(path: &std::path::Path) -> Option<u64> {
-    std::fs::metadata(path).ok().map(|m| m.len())
+/// How much memory decoded images may occupy, read from `IMAGINER_CACHE_MB`.
+///
+/// An environment variable rather than a setting, because there is no settings panel
+/// to put it in yet and the default is the number that matters. Anything unparseable
+/// falls back to the default rather than failing: a typo in a variable is no reason
+/// to refuse to open a photograph.
+fn cache_budget() -> usize {
+    std::env::var("IMAGINER_CACHE_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map_or(imaginer_core::cache::DEFAULT_BUDGET, |mb| {
+            mb.saturating_mul(1024 * 1024)
+        })
 }
 
 /// Export settings for a freshly opened file.

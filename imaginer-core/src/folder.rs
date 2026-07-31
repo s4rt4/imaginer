@@ -2,8 +2,9 @@
 //!
 //! Stepping to the next photo is the single most repeated action in a viewer, so
 //! the list it steps through is built once when a file is opened rather than
-//! re-scanned per keypress. It is also what slideshow and prefetch will walk, which
-//! is why it lives in core rather than next to the UI that happens to use it first.
+//! re-scanned per keypress. It is also what the slideshow steps through and what
+//! prefetch reads to decide which images to warm, which is why it lives in core
+//! rather than next to the UI that happens to use it first.
 
 use std::path::{Path, PathBuf};
 
@@ -53,6 +54,43 @@ impl Folder {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The images either side of the cursor, nearest first and forward before back.
+    ///
+    /// Forward first because that is the direction most sessions move in, and the
+    /// prefetch queue is worked in order: the image most likely to be asked for next
+    /// should not sit behind the one least likely.
+    ///
+    /// Wraps the way stepping does, so the last image in a folder still has a next.
+    /// Never returns the current image, and never the same one twice — in a folder of
+    /// two, forward and back are the same file, and decoding it twice would be work
+    /// spent to learn nothing.
+    ///
+    /// Takes `&self`: this answers "what is nearby", which is not the same question
+    /// as "take me there", and prefetching must not move the cursor.
+    pub fn neighbours(&self, radius: usize) -> Vec<PathBuf> {
+        let Some(current) = self.current else {
+            return Vec::new();
+        };
+        let len = self.entries.len() as isize;
+
+        // Seeded with the current index, so the image already on screen is excluded
+        // by the same rule that excludes repeats.
+        let mut indices = vec![current];
+        for distance in 1..=radius as isize {
+            for delta in [distance, -distance] {
+                let index = (current as isize + delta).rem_euclid(len) as usize;
+                if !indices.contains(&index) {
+                    indices.push(index);
+                }
+            }
+        }
+
+        indices[1..]
+            .iter()
+            .map(|&index| self.entries[index].clone())
+            .collect()
     }
 
     /// Step forward, wrapping at the end.
@@ -215,6 +253,57 @@ mod tests {
         assert_eq!(folder.remove(&dir.join("only.png")), None);
         assert!(folder.is_empty());
         assert_eq!(folder.current(), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn neighbours_come_back_nearest_first_and_forward_before_back() {
+        let dir = scratch("neighbours", &["a.png", "b.png", "c.png", "d.png", "e.png"]);
+        let folder = Folder::containing(&dir.join("c.png"));
+
+        assert_eq!(
+            folder.neighbours(2),
+            [
+                dir.join("d.png"),
+                dir.join("b.png"),
+                dir.join("e.png"),
+                dir.join("a.png"),
+            ]
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn neighbours_wrap_at_the_ends() {
+        let dir = scratch("neighbours-wrap", &["a.png", "b.png", "c.png"]);
+        let folder = Folder::containing(&dir.join("c.png"));
+
+        assert_eq!(folder.neighbours(1), [dir.join("a.png"), dir.join("b.png")]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn neighbours_never_repeat_an_image_or_name_the_current_one() {
+        let dir = scratch("neighbours-small", &["a.png", "b.png"]);
+        let folder = Folder::containing(&dir.join("a.png"));
+
+        // Forward and back are the same file here, and a radius past the end of the
+        // folder cannot conjure more images than there are.
+        assert_eq!(folder.neighbours(1), [dir.join("b.png")]);
+        assert_eq!(folder.neighbours(9), [dir.join("b.png")]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_lone_image_has_no_neighbours() {
+        let dir = scratch("neighbours-alone", &["only.png"]);
+        let folder = Folder::containing(&dir.join("only.png"));
+
+        assert!(folder.neighbours(2).is_empty());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

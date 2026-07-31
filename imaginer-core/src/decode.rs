@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Seek};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::metadata::{self, Orientation};
 
@@ -60,8 +61,16 @@ pub enum Stage {
 }
 
 /// A decoded image, already rotated per EXIF and in the RGBA8 layout the GPU wants.
+///
+/// Cheap to clone, which is what lets the cache hand the same image to the viewer
+/// twice without decoding it twice.
+#[derive(Clone)]
 pub struct Decoded {
-    pub pixels: image::RgbaImage,
+    /// Behind an `Arc` because one decode is wanted in three places at once — the
+    /// texture upload, the edit pipeline's untouched original, and the cache — and a
+    /// 24MP photograph is 100MB of pixels. Copying that around to share it would
+    /// undo the point of keeping it.
+    pub pixels: Arc<image::RgbaImage>,
     pub stage: Stage,
     pub orientation: Orientation,
     /// Native size of the source image, oriented. Known even for a preview, so the
@@ -79,6 +88,14 @@ impl Decoded {
     /// Raw RGBA8 bytes, row-major, straight (non-premultiplied) alpha.
     pub fn rgba_bytes(&self) -> &[u8] {
         self.pixels.as_raw()
+    }
+
+    /// How much memory the pixels occupy, which is what the cache budgets against.
+    ///
+    /// The buffer itself, not `size_of` the struct: everything else here is a
+    /// handful of bytes beside it.
+    pub fn byte_size(&self) -> usize {
+        self.pixels.as_raw().len()
     }
 
     /// Pixels ready to hand to the GPU, downscaled if the image is larger than the
@@ -176,7 +193,7 @@ pub fn decode_preview(path: &Path) -> Option<Decoded> {
         .unwrap_or_else(|| (img.width(), img.height()));
 
     Some(Decoded {
-        pixels: img.into_rgba8(),
+        pixels: Arc::new(img.into_rgba8()),
         stage: Stage::Preview,
         orientation,
         full_size,
@@ -217,7 +234,7 @@ pub fn decode_full(path: &Path) -> Result<Decoded, DecodeError> {
     let full_size = (img.width(), img.height());
 
     Ok(Decoded {
-        pixels: img.into_rgba8(),
+        pixels: Arc::new(img.into_rgba8()),
         stage: Stage::Full,
         orientation,
         full_size,
@@ -302,7 +319,11 @@ mod tests {
     #[test]
     fn for_upload_borrows_when_it_fits_and_scales_when_it_does_not() {
         let decoded = Decoded {
-            pixels: image::RgbaImage::from_pixel(64, 16, image::Rgba([1, 2, 3, 255])),
+            pixels: Arc::new(image::RgbaImage::from_pixel(
+                64,
+                16,
+                image::Rgba([1, 2, 3, 255]),
+            )),
             stage: Stage::Full,
             orientation: Orientation::Normal,
             full_size: (64, 16),
