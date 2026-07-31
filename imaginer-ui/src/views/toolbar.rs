@@ -109,7 +109,9 @@ pub fn show(
         ui.add_enabled_ui(bar.has_image, |ui| {
             ui.spacing_mut().item_spacing.x = BUTTON_SPACING;
 
-            if icons::button(ui, icons, Icon::Link, "Copy file path (Ctrl+Shift+C)").clicked() {
+            // `P`, not the Ctrl+Shift+C anyone would guess at: egui swallows every
+            // Ctrl+C combination before the app can see it. See `handle_shortcuts`.
+            if icons::button(ui, icons, Icon::Link, "Copy file path (P)").clicked() {
                 action = Some(Action::CopyPath);
             }
             // Last in the row, as far as it can get from the buttons that are

@@ -47,7 +47,14 @@ fn facts(ui: &mut egui::Ui, status: &Status<'_>) {
             .path
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "No image".to_owned());
+            // No path and an image anyway means pixels from the clipboard. Saying
+            // "No image" over a photograph would be a plain lie, and the thing worth
+            // saying is the thing that is different about it: nothing on disk holds
+            // this yet, so Save will ask where to put it.
+            .unwrap_or_else(|| match status.texture {
+                Some(_) => "Unsaved image".to_owned(),
+                None => "No image".to_owned(),
+            });
         ui.label(name);
 
         // Directly after the name, because it answers a question about the name:

@@ -17,7 +17,7 @@ use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
 use crate::views::crop::CropState;
 use crate::views::{crop, sidebar, statusbar, toolbar, viewer};
-use crate::{LoadMessage, decode_into, theme, titlebar};
+use crate::{LoadMessage, clipboard, decode_into, theme, titlebar};
 
 /// How long a status-bar notice stays up. Long enough to read in passing, short
 /// enough that it never becomes part of the furniture.
@@ -33,6 +33,13 @@ const SLIDE_DURATION: Duration = Duration::from_secs(4);
 /// direction — and the image that matters, the very next one, would be finished no
 /// sooner for it.
 const PREFETCH_RADIUS: usize = 1;
+
+/// What the clipboard worker has to report.
+enum ClipboardResult {
+    Copied,
+    Pasted(clipboard::Pasted),
+    Failed(String),
+}
 
 /// Confirmation of something whose only other evidence is that it worked.
 struct Notice {
@@ -69,14 +76,20 @@ impl NavTrace {
     }
 
     /// Full-resolution pixels are on screen. Reports what the wait was.
+    ///
+    /// Nothing to report without a path: pixels from the clipboard were not
+    /// navigated to and were never decoded, so timing them against the last
+    /// keypress would put a number in the log that measures nothing.
     fn arrived(&self, path: Option<&Path>) {
         if !self.enabled {
             return;
         }
-        let name = path
+        let Some(name) = path
             .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        else {
+            return;
+        };
         let source = if self.from_cache { "cached" } else { "decoded" };
         eprintln!(
             "nav: {name} {source} {:.1}ms",
@@ -140,6 +153,9 @@ pub struct App {
     /// Where the trim worker reports the opaque bounds it measured.
     trim_rx: Receiver<Option<(u32, u32, u32, u32)>>,
     trimming: bool,
+    /// Where the clipboard worker reports, in either direction.
+    clipboard_rx: Receiver<ClipboardResult>,
+    clipboard_busy: bool,
     /// Uploaded the first time the empty state is drawn, so launching with an image
     /// never pays for it.
     logotype: Option<egui::TextureHandle>,
@@ -202,6 +218,8 @@ impl App {
             saving: false,
             trim_rx: std::sync::mpsc::channel().1,
             trimming: false,
+            clipboard_rx: std::sync::mpsc::channel().1,
+            clipboard_busy: false,
             logotype: None,
             icons: Icons::default(),
             prefetch: Prefetcher::with_budget(cache_budget()),
@@ -247,14 +265,21 @@ impl App {
         }
     }
 
-    fn show(&mut self, ctx: &egui::Context, path: PathBuf) {
-        // A fresh channel per open, so results from a previous load that is still
-        // in flight cannot land on top of the new one.
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.rx = rx;
+    /// Clear out everything that belonged to the image being replaced.
+    ///
+    /// Shared by every route that puts a new image on screen — opened, stepped to,
+    /// or pasted — because forgetting one of these is exactly how an edit stack or a
+    /// stale decode leaks from one image into the next. `path` is `None` for pixels
+    /// that came from the clipboard and have no file behind them.
+    fn begin_showing(&mut self, path: Option<PathBuf>) {
+        // A channel with no sender, so a load still in flight is orphaned rather
+        // than left able to land on top of the new image. Whoever starts a decode
+        // replaces it with a live one; whoever does not has nothing to hear from.
+        self.rx = std::sync::mpsc::channel().1;
 
-        self.stamp = Stamp::of(&path);
-        self.path = Some(path.clone());
+        self.stamp = path.as_deref().and_then(Stamp::of);
+        self.export = export_defaults(path.as_deref());
+        self.path = path;
         self.stage = None;
         self.error = None;
         self.notice = None;
@@ -274,7 +299,15 @@ impl App {
         self.edits.clear();
         self.applying = false;
 
-        self.export = export_defaults(Some(&path));
+        // And so does a half-drawn crop: the selection is in image pixels, so left
+        // alone it would hang over the next image at coordinates that mean nothing
+        // there. Reachable from the slideshow, from a save that reloads, and from a
+        // paste, none of which go through the modal's own exits.
+        self.crop = None;
+    }
+
+    fn show(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.begin_showing(Some(path.clone()));
 
         // Prefetched or stepped back to, this image may already be decoded — in
         // which case it goes up in this very frame. No thread, no second frame, and
@@ -289,6 +322,8 @@ impl App {
         match ready {
             Some(decoded) => self.accept(ctx, decoded),
             None => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.rx = rx;
                 self.loading = true;
                 std::thread::Builder::new()
                     .name("decode".to_owned())
@@ -300,6 +335,34 @@ impl App {
         // After the image itself is under way, never before: the neighbours are the
         // one thing here nobody is waiting on.
         self.warm_neighbours();
+
+        ctx.request_repaint();
+    }
+
+    /// Show pixels that came from the clipboard rather than from a file.
+    ///
+    /// Having no path is a state the rest of the app has to respect rather than
+    /// route around: Save becomes Save-as because there is no original to overwrite,
+    /// Delete and Copy-path have nothing to act on, and the folder listing is empty
+    /// because a pasted image sits beside nothing.
+    fn show_pasted(&mut self, ctx: &egui::Context, pixels: RgbaImage) {
+        self.begin_showing(None);
+        // Not the previous image's listing, which belongs to a folder this image is
+        // not in. Rebuilt empty on first use, since there is no path to build from.
+        self.folder = None;
+
+        let full_size = pixels.dimensions();
+        self.accept(
+            ctx,
+            imaginer_core::Decoded {
+                pixels: Arc::new(pixels),
+                stage: Stage::Full,
+                // Clipboard pixels carry no EXIF: whatever put them there had already
+                // resolved any rotation into the pixels themselves.
+                orientation: imaginer_core::Orientation::Normal,
+                full_size,
+            },
+        );
 
         ctx.request_repaint();
     }
@@ -462,19 +525,43 @@ impl App {
         // Order matters here: a pattern only demands the modifiers it names, so
         // Ctrl+O matches a Ctrl+Shift+O press too. Consuming the more specific
         // shortcut first is what keeps the two apart.
-        let (open_folder, copy_path, redo, open, undo, save) = ctx.input_mut(|i| {
+        let (open_folder, redo, open, undo, save) = ctx.input_mut(|i| {
             (
                 i.consume_key(CTRL_SHIFT, Key::O),
-                // Ctrl+C is reserved for copying the image itself, which is what
-                // anyone pressing it in a viewer expects; the path takes the
-                // shifted variant.
-                i.consume_key(CTRL_SHIFT, Key::C),
                 // Bitwise, not short-circuiting: both spellings of redo have to be
                 // consumed, or the unread one is left for something else to act on.
                 i.consume_key(CTRL_SHIFT, Key::Z) | i.consume_key(CTRL, Key::Y),
                 i.consume_key(CTRL, Key::O),
                 i.consume_key(CTRL, Key::Z),
                 i.consume_key(CTRL, Key::S),
+            )
+        });
+
+        // The clipboard shortcuts cannot be read the way everything above is, and
+        // that is a property of the framework rather than a choice. egui-winit
+        // intercepts them before any key event exists: Ctrl+C becomes `Event::Copy`
+        // and returns, Ctrl+V becomes `Event::Paste` — but only when the clipboard
+        // holds *text*, so an image on it produces no event at all. Its test is
+        // `command && key == C`, with shift neither required nor excluded, which is
+        // also why the `Ctrl+Shift+C` this app used to bind for copy-path could
+        // never once have fired.
+        //
+        // So Ctrl+C arrives as `Event::Copy` and copies the image, which is what
+        // Ctrl+C means in a viewer. Paste answers to `Event::Paste` when egui sends
+        // one, and to a plain `V` always — the only spelling that survives, since
+        // every Ctrl+V variant is swallowed whether or not anything comes back.
+        // Copy-path moves to plain `P` for the same reason, beside its toolbar
+        // button, which was doing all the work already.
+        let (copy_image, pasted_text) = ctx.input(|i| {
+            (
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+            )
+        });
+        let (copy_path, paste) = ctx.input_mut(|i| {
+            (
+                i.consume_key(NONE, Key::P),
+                i.consume_key(NONE, Key::V) | pasted_text,
             )
         });
 
@@ -516,6 +603,12 @@ impl App {
             self.prompt_for_folder(ctx);
             return;
         }
+        // Above the guard below: pasting is how an empty window stops being empty,
+        // so it is one of the few things that has to work with nothing open.
+        if paste {
+            self.paste(ctx);
+            return;
+        }
 
         if self.texture.is_none() {
             return;
@@ -541,6 +634,9 @@ impl App {
         }
         if copy_path {
             self.copy_path();
+        }
+        if copy_image {
+            self.copy_image(ctx);
         }
         if delete {
             self.delete_current(ctx);
@@ -723,20 +819,33 @@ impl App {
     /// different format or a different size is a new file, and quietly replacing
     /// the original with it is how originals get lost.
     fn save(&mut self, ctx: &egui::Context) {
-        let (Some(source), Some(path)) = (self.source.clone(), self.path.clone()) else {
+        let Some(source) = self.source.clone() else {
             return;
         };
 
-        let converting = imaginer_core::Format::from_path(&path) != Some(self.export.format);
-        let resizing = self.export.scale_percent != 100;
+        let target = match self.path.clone() {
+            Some(path) => {
+                let converting =
+                    imaginer_core::Format::from_path(&path) != Some(self.export.format);
+                let resizing = self.export.scale_percent != 100;
 
-        let target = if converting || resizing {
-            let Some(target) = self.prompt_for_save_path(&path, converting) else {
-                return;
-            };
-            target
-        } else {
-            path
+                if converting || resizing {
+                    let Some(target) = self.prompt_for_save_path(&path, converting) else {
+                        return;
+                    };
+                    target
+                } else {
+                    path
+                }
+            }
+            // Pasted pixels: there is no original to take the place of, so this is
+            // always a new file and always asks where to put it.
+            None => {
+                let Some(target) = self.prompt_for_new_file() else {
+                    return;
+                };
+                target
+            }
         };
 
         // Off the UI thread: re-running the pipeline and then encoding a 24MP PNG is
@@ -789,6 +898,19 @@ impl App {
         }
 
         dialog.save_file()
+    }
+
+    /// Where to write an image that has never been a file.
+    ///
+    /// No starting directory: there is no original to sit beside, and the dialog's
+    /// own memory of where the user last saved something is a better guess than
+    /// anything this app could invent.
+    fn prompt_for_new_file(&self) -> Option<PathBuf> {
+        let format = self.export.format;
+        rfd::FileDialog::new()
+            .add_filter(format.label(), &[format.extension()])
+            .set_file_name(format!("pasted.{}", format.extension()))
+            .save_file()
     }
 
     fn poll_save(&mut self, ctx: &egui::Context) {
@@ -867,11 +989,93 @@ impl App {
         let Some(path) = self.path.as_deref() else {
             return;
         };
-        let text = path.display().to_string();
 
-        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+        match clipboard::copy_text(path.display().to_string()) {
             Ok(()) => self.notify("Path copied"),
-            Err(err) => self.error = Some(format!("Could not copy the path: {err}")),
+            Err(message) => self.error = Some(message),
+        }
+    }
+
+    /// Put the image as it now looks on the clipboard.
+    ///
+    /// The edited pixels, not the file on disk. What Ctrl+C means in a viewer is
+    /// "the thing I am looking at" — rotating an image and then pasting the
+    /// unrotated original elsewhere is the wrong kind of surprise.
+    fn copy_image(&mut self, ctx: &egui::Context) {
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        let edits = self.edits.clone();
+        let tx = self.start_clipboard_job();
+
+        // Off the UI thread: the pipeline runs and then the whole buffer is rewritten
+        // into the bitmap layout Windows wants, which for a 24MP photograph is a
+        // couple of hundred milliseconds of a window that would otherwise not draw.
+        std::thread::Builder::new()
+            .name("clipboard".to_owned())
+            .spawn(move || {
+                let pixels = edits.apply(&source);
+                let _ = tx.send(match clipboard::copy_image(&pixels) {
+                    Ok(()) => ClipboardResult::Copied,
+                    Err(message) => ClipboardResult::Failed(message),
+                });
+            })
+            .expect("failed to spawn clipboard thread");
+
+        ctx.request_repaint();
+    }
+
+    /// Show whatever is on the clipboard.
+    fn paste(&mut self, ctx: &egui::Context) {
+        let tx = self.start_clipboard_job();
+
+        // Also off the UI thread, for the same reason in reverse: reading a
+        // full-screen screenshot back is a copy of somebody else's megabytes.
+        std::thread::Builder::new()
+            .name("clipboard".to_owned())
+            .spawn(move || {
+                let _ = tx.send(match clipboard::paste() {
+                    Ok(pasted) => ClipboardResult::Pasted(pasted),
+                    Err(message) => ClipboardResult::Failed(message),
+                });
+            })
+            .expect("failed to spawn clipboard thread");
+
+        ctx.request_repaint();
+    }
+
+    /// A fresh channel per clipboard job, so one the user has already moved past has
+    /// nowhere to deliver. Copy and paste share it: neither is worth waiting for
+    /// while the other runs, and the newer request is always the one meant.
+    fn start_clipboard_job(&mut self) -> std::sync::mpsc::Sender<ClipboardResult> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.clipboard_rx = rx;
+        self.clipboard_busy = true;
+        tx
+    }
+
+    fn poll_clipboard(&mut self, ctx: &egui::Context) {
+        let result = match self.clipboard_rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            // The worker vanished without sending; nothing is coming.
+            Err(TryRecvError::Disconnected) => {
+                self.clipboard_busy = false;
+                return;
+            }
+        };
+        self.clipboard_busy = false;
+
+        match result {
+            ClipboardResult::Copied => self.notify("Image copied"),
+            // A path goes through `open` rather than `show`: it names a file in some
+            // folder, and the images beside it are as much a part of opening it as
+            // the pixels are.
+            ClipboardResult::Pasted(clipboard::Pasted::Path(path)) => self.open(ctx, path),
+            ClipboardResult::Pasted(clipboard::Pasted::Image(pixels)) => {
+                self.show_pasted(ctx, pixels)
+            }
+            ClipboardResult::Failed(message) => self.error = Some(message),
         }
     }
 
@@ -978,7 +1182,11 @@ impl App {
                     matches!(
                         event,
                         egui::Event::Key { key, pressed: true, .. } if *key != egui::Key::Space
-                    )
+                    // Ctrl+C and Ctrl+V never arrive as key presses, so without
+                    // these two a slideshow would carry on running underneath a
+                    // copy — and the next slide would land before the worker had
+                    // read the image the user meant.
+                    ) || matches!(event, egui::Event::Copy | egui::Event::Paste(_))
                 })
         });
 
@@ -1042,6 +1250,10 @@ impl eframe::App for App {
         }
         if self.trimming {
             self.poll_trim(&ctx);
+            ctx.request_repaint();
+        }
+        if self.clipboard_busy {
+            self.poll_clipboard(&ctx);
             ctx.request_repaint();
         }
 

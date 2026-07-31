@@ -4,6 +4,7 @@
 
 mod app;
 mod cli;
+mod clipboard;
 mod collector;
 mod console;
 mod icons;

@@ -27,9 +27,12 @@ log = "0.4"
 # backends, which are Linux-only and unreachable from here.
 rfd = { version = "0.17.2", default-features = false }
 
-# Clipboard. Text only for now: the `image-data` default feature pulls in a second
-# copy of `image` and a GDI dependency, and copy-image is a Phase 3 item.
-arboard = { version = "3.6.1", default-features = false }
+# Clipboard, text and pixels. `image-data` was kept off on the grounds that it pulls
+# a second copy of `image` — checked when copy-image landed, and on Windows it does
+# not: arboard asks for `image` 0.25 with png+bmp, which unifies with the one
+# `imaginer-core` already builds. What it actually adds is `Win32_Graphics_Gdi`, for
+# the DIBV5 conversion that an image on the Windows clipboard is.
+arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
 
 # Deleting goes to the Recycle Bin, never `fs::remove_file` — an image viewer that
 # can silently destroy an original is not a tool anyone should trust.
