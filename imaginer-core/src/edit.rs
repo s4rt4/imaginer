@@ -11,6 +11,8 @@ use std::borrow::Cow;
 
 use image::RgbaImage;
 
+use crate::adjust::Adjust;
+
 /// One step in the pipeline.
 ///
 /// The split that matters is not flip-versus-rotate but whether an op changes the
@@ -45,12 +47,21 @@ pub enum Op {
         width: u32,
         height: u32,
     },
+    /// Brightness, contrast and saturation, as absolute settings.
+    ///
+    /// Absolute, not a delta, because that is what a slider reports — which means
+    /// two of these in a row must not compose, or dragging a slider twice would
+    /// apply it twice. [`Edits::apply`] runs only the last one; see the note there.
+    Adjust(Adjust),
 }
 
 impl Op {
     /// Whether applying this op changes the image's dimensions.
     pub fn changes_size(self) -> bool {
-        !matches!(self, Self::FlipHorizontal | Self::FlipVertical)
+        !matches!(
+            self,
+            Self::FlipHorizontal | Self::FlipVertical | Self::Adjust(_)
+        )
     }
 
     /// Dimensions this op produces from `size`.
@@ -60,7 +71,7 @@ impl Op {
     pub fn size_after(self, size: (u32, u32)) -> (u32, u32) {
         let (w, h) = size;
         match self {
-            Self::FlipHorizontal | Self::FlipVertical => (w, h),
+            Self::FlipHorizontal | Self::FlipVertical | Self::Adjust(_) => (w, h),
             Self::RotateCw | Self::RotateCcw => (h, w),
             Self::MirrorHorizontal => (w.saturating_mul(2), h),
             Self::MirrorVertical => (w, h.saturating_mul(2)),
@@ -112,6 +123,11 @@ impl Op {
                     return src.clone();
                 }
                 imageops::crop_imm(src, x, y, width, height).to_image()
+            }
+            Self::Adjust(adjust) => {
+                let mut out = src.clone();
+                adjust.apply(&mut out);
+                out
             }
         }
     }
@@ -230,6 +246,62 @@ impl Edits {
         &self.applied
     }
 
+    /// The colour adjustment currently in force, which is the last one pushed.
+    ///
+    /// What the sliders read when an image is opened, and what they return to after
+    /// an undo — the setting before the one just removed, not zero.
+    pub fn adjust(&self) -> Adjust {
+        self.applied
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                Op::Adjust(adjust) => Some(*adjust),
+                _ => None,
+            })
+            .unwrap_or(Adjust::NONE)
+    }
+
+    /// This pipeline with `adjust` in place of whatever adjustment it holds.
+    ///
+    /// For previewing a slider mid-drag, which must not touch the undo stack — a
+    /// drag from 0 to 40 passes through every value in between, and none of those
+    /// are steps anybody wants to undo through.
+    pub fn previewing(&self, adjust: Adjust) -> Self {
+        let mut previewed = self.clone();
+        // Simply pushing is enough: only the last adjustment runs.
+        previewed.applied.push(Op::Adjust(adjust));
+        previewed
+    }
+
+    /// The ops that actually run.
+    ///
+    /// Adjustments carry absolute slider values, so a stack holding three of them
+    /// records that the sliders moved three times — not that the image should be
+    /// adjusted three times over. Only the last one survives here, which is exactly
+    /// what makes undo step back through the earlier settings instead of jumping
+    /// straight to none. One that has been dragged back to zero is dropped as well,
+    /// so an image returned to its original settings costs no work at all.
+    ///
+    /// Running the survivor where it sits rather than at the end of the list is safe
+    /// because every other op only rearranges pixels: adjust-then-rotate and
+    /// rotate-then-adjust produce the same picture.
+    fn effective(&self) -> Vec<Op> {
+        let last_adjust = self
+            .applied
+            .iter()
+            .rposition(|op| matches!(op, Op::Adjust(_)));
+
+        self.applied
+            .iter()
+            .enumerate()
+            .filter(|(index, op)| match op {
+                Op::Adjust(adjust) => Some(*index) == last_adjust && !adjust.is_none(),
+                _ => true,
+            })
+            .map(|(_, op)| *op)
+            .collect()
+    }
+
     /// Forget everything, as after a save or a new image.
     pub fn clear(&mut self) {
         self.applied.clear();
@@ -249,16 +321,39 @@ impl Edits {
     /// being looked at rather than edited must not pay for a copy of itself every
     /// time something asks for the current pixels.
     pub fn apply<'a>(&self, base: &'a RgbaImage) -> Cow<'a, RgbaImage> {
-        let Some((first, rest)) = self.applied.split_first() else {
-            return Cow::Borrowed(base);
-        };
-
-        let mut image = first.apply(base);
-        for op in rest {
-            image = op.apply(&image);
-        }
-        Cow::Owned(image)
+        run(&self.effective(), base)
     }
+
+    /// Run only the steps that move pixels about, leaving colour alone.
+    ///
+    /// What the preview texture is built from. The colour adjustment is applied by a
+    /// shader at draw time instead, because on a 24MP image it costs 400ms on the CPU
+    /// and a slider being dragged has 16ms — measured, see `adjust::tests::adjust_costs`.
+    /// Keeping it out of the texture also means undoing an adjustment changes a
+    /// uniform rather than re-running the pipeline.
+    ///
+    /// Every path that writes a file uses [`Edits::apply`], which does include it.
+    pub fn apply_geometry<'a>(&self, base: &'a RgbaImage) -> Cow<'a, RgbaImage> {
+        let ops: Vec<Op> = self
+            .applied
+            .iter()
+            .copied()
+            .filter(|op| !matches!(op, Op::Adjust(_)))
+            .collect();
+        run(&ops, base)
+    }
+}
+
+fn run<'a>(ops: &[Op], base: &'a RgbaImage) -> Cow<'a, RgbaImage> {
+    let Some((first, rest)) = ops.split_first() else {
+        return Cow::Borrowed(base);
+    };
+
+    let mut image = first.apply(base);
+    for op in rest {
+        image = op.apply(&image);
+    }
+    Cow::Owned(image)
 }
 
 #[cfg(test)]
@@ -488,7 +583,148 @@ mod tests {
     fn only_flips_leave_the_size_alone() {
         assert!(!Op::FlipHorizontal.changes_size());
         assert!(!Op::FlipVertical.changes_size());
+        assert!(!Op::Adjust(Adjust::NONE).changes_size());
         assert!(Op::RotateCw.changes_size());
         assert!(Op::MirrorHorizontal.changes_size());
+    }
+
+    fn brighter(percent: i16) -> Op {
+        Op::Adjust(Adjust {
+            brightness: percent,
+            ..Adjust::NONE
+        })
+    }
+
+    #[test]
+    fn only_the_last_adjustment_runs() {
+        let src = asymmetric();
+
+        // Two settings on the stack is a slider that moved twice, not an image to
+        // brighten twice. Pushing +10 then +20 must look exactly like +20 alone.
+        let mut twice = Edits::default();
+        twice.push(brighter(10));
+        twice.push(brighter(20));
+
+        let mut once = Edits::default();
+        once.push(brighter(20));
+
+        assert_eq!(*twice.apply(&src), *once.apply(&src));
+    }
+
+    #[test]
+    fn undo_returns_to_the_previous_setting_rather_than_to_none() {
+        let src = asymmetric();
+        let mut edits = Edits::default();
+        edits.push(brighter(10));
+        edits.push(brighter(20));
+        edits.undo();
+
+        assert_eq!(
+            edits.adjust(),
+            Adjust {
+                brightness: 10,
+                ..Adjust::NONE
+            }
+        );
+
+        let mut only_ten = Edits::default();
+        only_ten.push(brighter(10));
+        assert_eq!(*edits.apply(&src), *only_ten.apply(&src));
+    }
+
+    #[test]
+    fn an_adjustment_dragged_back_to_zero_costs_nothing() {
+        let src = asymmetric();
+        let mut edits = Edits::default();
+        edits.push(brighter(30));
+        edits.push(brighter(0));
+
+        // Not merely equal pixels — no work at all, which is what keeps a slider
+        // returned to its starting point from leaving a copy of the image behind.
+        assert!(matches!(edits.apply(&src), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn an_adjustment_commutes_with_the_geometry_around_it() {
+        // The claim `effective` rests on when it runs the surviving adjustment where
+        // it sits rather than at the end: every other op only moves pixels about.
+        let src = asymmetric();
+
+        let mut first = Edits::default();
+        first.push(brighter(25));
+        first.push(Op::RotateCw);
+
+        let mut second = Edits::default();
+        second.push(Op::RotateCw);
+        second.push(brighter(25));
+
+        assert_eq!(*first.apply(&src), *second.apply(&src));
+    }
+
+    #[test]
+    fn previewing_shows_a_setting_without_recording_it() {
+        let src = asymmetric();
+        let mut edits = Edits::default();
+        edits.push(Op::RotateCw);
+
+        let preview = edits.previewing(Adjust {
+            brightness: 40,
+            ..Adjust::NONE
+        });
+
+        let mut committed = Edits::default();
+        committed.push(Op::RotateCw);
+        committed.push(brighter(40));
+        assert_eq!(*preview.apply(&src), *committed.apply(&src));
+
+        // And the stack it came from is untouched, so nothing has to be undone.
+        assert_eq!(edits.ops(), [Op::RotateCw]);
+        assert_eq!(edits.adjust(), Adjust::NONE);
+    }
+
+    #[test]
+    fn the_geometry_pass_leaves_colour_alone_but_keeps_every_move() {
+        let src = asymmetric();
+        let mut edits = Edits::default();
+        edits.push(Op::RotateCw);
+        edits.push(brighter(60));
+        edits.push(Op::FlipVertical);
+
+        let mut without_colour = Edits::default();
+        without_colour.push(Op::RotateCw);
+        without_colour.push(Op::FlipVertical);
+
+        assert_eq!(
+            *edits.apply_geometry(&src),
+            *without_colour.apply(&src),
+            "the texture must show every move and no colour change"
+        );
+        // And what gets saved is still the adjusted image.
+        assert_ne!(*edits.apply(&src), *edits.apply_geometry(&src));
+    }
+
+    #[test]
+    fn a_colour_only_pipeline_leaves_the_geometry_pass_borrowing() {
+        let src = asymmetric();
+        let mut edits = Edits::default();
+        edits.push(brighter(60));
+
+        assert!(matches!(edits.apply_geometry(&src), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn previewing_replaces_rather_than_compounds_an_existing_adjustment() {
+        let src = asymmetric();
+        let mut edits = Edits::default();
+        edits.push(brighter(60));
+
+        let preview = edits.previewing(Adjust {
+            brightness: 5,
+            ..Adjust::NONE
+        });
+
+        let mut only_five = Edits::default();
+        only_five.push(brighter(5));
+        assert_eq!(*preview.apply(&src), *only_five.apply(&src));
     }
 }

@@ -1,8 +1,10 @@
 //! The main canvas: pan, zoom, and the navigation chevrons that float over it.
 
 use eframe::egui;
+use imaginer_core::Adjust;
 
 use crate::icons::{self, Icon, Icons};
+use crate::shader::AdjustShader;
 use crate::texture::ImageTexture;
 use crate::theme;
 
@@ -67,6 +69,14 @@ pub struct Shown {
     pub image_rect: egui::Rect,
 }
 
+/// How the image is to be coloured on the way to the screen.
+pub struct Colour<'a> {
+    /// The live slider values. At rest the image is drawn the ordinary way, so an
+    /// unedited photograph never goes near the shader.
+    pub adjust: Adjust,
+    pub shader: &'a AdjustShader,
+}
+
 /// Draw the image and handle interaction.
 ///
 /// `interactive` is false while cropping: the canvas belongs to the selection then,
@@ -77,6 +87,7 @@ pub fn show(
     texture: &ImageTexture,
     state: &mut ViewState,
     interactive: bool,
+    colour: Colour<'_>,
 ) -> Shown {
     let sense = if interactive {
         egui::Sense::click_and_drag()
@@ -138,12 +149,25 @@ pub fn show(
     state.offset = clamp_offset(state.offset, displayed, rect.size());
 
     let image_rect = egui::Rect::from_center_size(rect.center() + state.offset, displayed);
-    ui.painter_at(rect).image(
-        texture.handle.id(),
-        image_rect,
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
-    );
+    let painter = ui.painter_at(rect);
+
+    // The shader is only worth reaching for when it has something to do, and it is
+    // skipped entirely if it could not be built — on hardware that cannot compile
+    // it, the adjustment still reaches the saved file, it just is not previewed.
+    if colour.adjust.is_none() || colour.shader.failed() {
+        painter.image(
+            texture.handle.id(),
+            image_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else {
+        painter.add(
+            colour
+                .shader
+                .callback(rect, image_rect, texture.handle.id(), colour.adjust),
+        );
+    }
 
     Shown { zoom, image_rect }
 }

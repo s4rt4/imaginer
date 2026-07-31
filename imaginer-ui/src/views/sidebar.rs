@@ -7,7 +7,8 @@
 //! also what gives Save an obvious home.
 
 use eframe::egui;
-use imaginer_core::{Edits, ExportSettings, Format, Op};
+use imaginer_core::adjust::LIMIT;
+use imaginer_core::{Adjust, Edits, ExportSettings, Format, Op};
 
 use crate::icons::{self, Icon, Icons};
 use crate::theme;
@@ -30,6 +31,14 @@ pub enum Action {
     SetAspect(Aspect),
     ApplyCrop,
     CancelCrop,
+    /// A slider moved. Shown immediately, recorded only on [`Action::CommitAdjust`]
+    /// — a drag from 0 to 40 passes through every value between, and none of them
+    /// are steps anyone wants to undo through.
+    Adjusting,
+    /// The slider was let go, so this setting becomes an entry on the undo stack.
+    CommitAdjust,
+    /// Put all three back to nothing, in one step.
+    ResetAdjust,
 }
 
 /// The crop half of the sidebar's state, present only while cropping.
@@ -42,6 +51,9 @@ pub struct Cropping {
 
 pub struct State<'a> {
     pub edits: &'a Edits,
+    /// The live slider values, which the shader is drawing with. Written straight
+    /// through by the sliders — the app sees the change as an [`Action`].
+    pub adjust: &'a mut Adjust,
     pub settings: &'a mut ExportSettings,
     /// Size of the edited image, before any export scaling.
     pub edited_size: Option<(u32, u32)>,
@@ -82,6 +94,16 @@ pub fn show(ui: &mut egui::Ui, icons: &mut Icons, state: &mut State<'_>) -> Opti
             };
             if let Some(requested) = requested {
                 action = Some(requested);
+            }
+
+            // Below Transform and above Export, which is the order the work happens
+            // in: straighten it, then colour it, then decide how to write it out.
+            // Hidden while cropping, along with everything else that is not the crop.
+            if state.cropping.is_none() {
+                ui.add_space(14.0);
+                if let Some(requested) = colour(ui, state) {
+                    action = Some(requested);
+                }
             }
         });
 
@@ -266,6 +288,63 @@ fn transform(ui: &mut egui::Ui, icons: &mut Icons, state: &State<'_>) -> Option<
                 ui.colored_label(theme::TEXT_MUTED, changes_summary(state.edits));
             });
         });
+    });
+
+    action
+}
+
+/// Brightness, contrast and saturation.
+///
+/// Three sliders and a reset, and no icons: these are continuous quantities, and an
+/// icon pair would only offer "a bit more" and "a bit less" of something the number
+/// says exactly.
+fn colour(ui: &mut egui::Ui, state: &mut State<'_>) -> Option<Action> {
+    let mut action = None;
+
+    ui.horizontal(|ui| {
+        ui.colored_label(theme::TEXT_MUTED, egui::RichText::new("Colour").small());
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Only when there is something to undo, so the row stays quiet on an
+            // image nobody has touched.
+            ui.add_enabled_ui(!state.adjust.is_none(), |ui| {
+                if ui
+                    .small_button("Reset")
+                    .on_hover_text("Put all three back to nothing")
+                    .clicked()
+                {
+                    action = Some(Action::ResetAdjust);
+                }
+            });
+        });
+    });
+    ui.add_space(6.0);
+
+    ui.add_enabled_ui(state.has_image, |ui| {
+        let mut sliders = [
+            ("Brightness", &mut state.adjust.brightness),
+            ("Contrast", &mut state.adjust.contrast),
+            ("Saturation", &mut state.adjust.saturation),
+        ];
+
+        for (label, value) in &mut sliders {
+            let response = ui.add(
+                egui::Slider::new(*value, -LIMIT..=LIMIT)
+                    .text(*label)
+                    .clamping(egui::SliderClamping::Always),
+            );
+
+            // Two different things: `changed` is every value the drag passes
+            // through, and only the shader cares about those. The commit is the
+            // release — or a click or an arrow key, which change the value without
+            // ever dragging and would otherwise never be recorded at all.
+            if response.changed() {
+                action = Some(Action::Adjusting);
+            }
+            if response.drag_stopped() || (response.changed() && !response.dragged()) {
+                action = Some(Action::CommitAdjust);
+            }
+        }
     });
 
     action

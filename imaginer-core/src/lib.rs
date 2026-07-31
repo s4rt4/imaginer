@@ -6,6 +6,7 @@
 // directly — one crate deciding the version is one fewer way for the two to drift.
 pub use image;
 
+pub mod adjust;
 pub mod cache;
 pub mod convert;
 pub mod decode;
@@ -14,6 +15,7 @@ pub mod export;
 pub mod folder;
 pub mod metadata;
 
+pub use adjust::Adjust;
 pub use cache::{ImageCache, Stamp};
 pub use convert::{Outcome as ConvertOutcome, convert_all, convert_file};
 pub use decode::{

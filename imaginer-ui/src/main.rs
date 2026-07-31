@@ -11,6 +11,7 @@ mod icons;
 mod idle;
 mod logo;
 mod prefetch;
+mod shader;
 mod startup;
 mod texture;
 mod theme;

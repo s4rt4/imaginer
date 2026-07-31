@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use imaginer_core::image::RgbaImage;
-use imaginer_core::{Decoded, Edits, Folder, Op, Stage, Stamp};
+use imaginer_core::{Adjust, Decoded, Edits, Folder, Op, Stage, Stamp};
 
 use crate::icons::Icons;
 use crate::idle;
 use crate::logo;
 use crate::prefetch::Prefetcher;
+use crate::shader::AdjustShader;
 use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
 use crate::views::crop::CropState;
@@ -129,6 +130,12 @@ pub struct App {
     /// an image evicted while it is still on screen costs nothing to keep showing.
     source: Option<Arc<RgbaImage>>,
     edits: Edits,
+    /// What the colour sliders are showing, which is not always what the undo stack
+    /// holds: mid-drag it runs ahead, and it is committed when the slider is let go.
+    /// The texture never contains it — the shader applies it at draw time.
+    adjust: Adjust,
+    /// Draws the adjustment. Compiled on first use, not at startup.
+    shader: AdjustShader,
     /// Results from the edit worker. Replaced per run, so a stale result from a
     /// pipeline the user has already moved past has nowhere to land.
     edit_rx: Receiver<RgbaImage>,
@@ -204,6 +211,8 @@ impl App {
             folder: None,
             source: None,
             edits: Edits::default(),
+            adjust: Adjust::NONE,
+            shader: AdjustShader::default(),
             // A channel with no sender: `applying` is false, so nothing reads it
             // until the first edit replaces it with a live one.
             edit_rx: std::sync::mpsc::channel().1,
@@ -297,6 +306,7 @@ impl App {
         // silently rotate the next photo because of something done to the last one.
         self.source = None;
         self.edits.clear();
+        self.adjust = Adjust::NONE;
         self.applying = false;
 
         // And so does a half-drawn crop: the selection is in image pixels, so left
@@ -456,6 +466,23 @@ impl App {
         }
     }
 
+    /// Record what the sliders now show, so it can be undone.
+    ///
+    /// Called when a slider is let go rather than as it moves. Nothing happens if the
+    /// value is already the one on the stack — clicking a slider without moving it
+    /// should not add a step to undo through.
+    fn commit_adjust(&mut self, ctx: &egui::Context) {
+        if self.adjust == self.edits.adjust() {
+            return;
+        }
+        self.edits.push(Op::Adjust(self.adjust));
+
+        // No `reapply`: the texture is deliberately free of colour, so a committed
+        // adjustment changes nothing about it. This is only the undo stack catching
+        // up with what the screen has been showing all along.
+        ctx.request_repaint();
+    }
+
     /// Re-run the whole pipeline from the original pixels, off the UI thread.
     ///
     /// From the original every time rather than incrementally, because that is what
@@ -468,6 +495,11 @@ impl App {
         };
         let edits = self.edits.clone();
 
+        // The sliders follow the stack, which is what makes undoing an adjustment
+        // move them back rather than leave them describing an image that has changed
+        // underneath them.
+        self.adjust = edits.adjust();
+
         // Fresh channel per run: an earlier pipeline still finishing has nowhere to
         // deliver, so it cannot overwrite the newer result.
         let (tx, rx) = std::sync::mpsc::channel();
@@ -478,7 +510,8 @@ impl App {
         std::thread::Builder::new()
             .name("edit".to_owned())
             .spawn(move || {
-                let _ = tx.send(edits.apply(&source).into_owned());
+                // Geometry only. Colour is the shader's job, every frame, for free.
+                let _ = tx.send(edits.apply_geometry(&source).into_owned());
             })
             .expect("failed to spawn edit thread");
 
@@ -503,6 +536,41 @@ impl App {
             Err(TryRecvError::Empty) => {}
             // The worker vanished without sending; nothing is coming.
             Err(TryRecvError::Disconnected) => self.applying = false,
+        }
+    }
+
+    /// The shortcuts that keep working while a widget holds the keyboard.
+    ///
+    /// Split out so the focused case cannot quietly drift from the unfocused one:
+    /// both call this, and only the plain keys differ between them.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_modified(
+        &mut self,
+        ctx: &egui::Context,
+        open: bool,
+        open_folder: bool,
+        undo: bool,
+        redo: bool,
+        save: bool,
+        copy_image: bool,
+    ) {
+        if open {
+            self.prompt_for_file(ctx);
+        }
+        if open_folder {
+            self.prompt_for_folder(ctx);
+        }
+        if undo {
+            self.undo(ctx);
+        }
+        if redo {
+            self.redo(ctx);
+        }
+        if save {
+            self.save(ctx);
+        }
+        if copy_image && self.source.is_some() {
+            self.copy_image(ctx);
         }
     }
 
@@ -558,6 +626,21 @@ impl App {
                 i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
             )
         });
+
+        // A focused widget owns the plain keys, so everything below this point waits.
+        // The colour sliders are the first things in this app to take keyboard focus,
+        // and without this an arrow key meant to nudge brightness would step to the
+        // next image instead — this handler runs before any widget is drawn, so it
+        // would win every time. Escape belongs to the widget too: egui uses it to
+        // leave one, and closing the window out from under somebody tabbing through
+        // sliders is not what they asked for.
+        //
+        // Modified shortcuts are unaffected. Ctrl+S means save wherever focus is.
+        if ctx.memory(|memory| memory.focused().is_some()) {
+            self.apply_modified(ctx, open, open_folder, undo, redo, save, copy_image);
+            return;
+        }
+
         let (copy_path, paste) = ctx.input_mut(|i| {
             (
                 i.consume_key(NONE, Key::P),
@@ -712,6 +795,16 @@ impl App {
             }
             sidebar::Action::ApplyCrop => self.apply_crop(ctx),
             sidebar::Action::CancelCrop => self.crop = None,
+            // Nothing to do: the slider has already written its new value into
+            // `self.adjust`, and the shader reads that when the frame is drawn.
+            // Which is the whole point — a slider that costs a repaint and nothing
+            // else is one that can be dragged.
+            sidebar::Action::Adjusting => {}
+            sidebar::Action::CommitAdjust => self.commit_adjust(ctx),
+            sidebar::Action::ResetAdjust => {
+                self.adjust = Adjust::NONE;
+                self.commit_adjust(ctx);
+            }
         }
     }
 
@@ -1230,6 +1323,13 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Hand the shader's GL objects back while the context is still alive.
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let Some(gl) = gl {
+            self.shader.destroy(gl);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
@@ -1330,6 +1430,7 @@ impl eframe::App for App {
                         &mut self.icons,
                         &mut sidebar::State {
                             edits: &self.edits,
+                            adjust: &mut self.adjust,
                             settings: &mut self.export,
                             edited_size: self
                                 .source
@@ -1355,7 +1456,16 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 if let Some(texture) = self.texture.as_ref() {
                     let canvas = ui.max_rect();
-                    let shown = viewer::show(ui, texture, &mut self.view, self.crop.is_none());
+                    let shown = viewer::show(
+                        ui,
+                        texture,
+                        &mut self.view,
+                        self.crop.is_none(),
+                        viewer::Colour {
+                            adjust: self.adjust,
+                            shader: &self.shader,
+                        },
+                    );
                     self.last_zoom = shown.zoom;
 
                     match self.crop.as_mut() {
