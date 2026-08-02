@@ -15,10 +15,15 @@
 //! the same bytes. The one difference that has to be undone is premultiplied alpha,
 //! which egui applies on upload and core knows nothing about.
 //!
-//! `tests::the_shader_formula_matches_core` pins the arithmetic. It transcribes the
-//! fragment maths into Rust and compares against core over a grid — it does not
-//! execute GLSL, so a typo inside the shader source is caught by the compile, by the
-//! eye, or not at all. Keep the two side by side when changing either.
+//! Two things check that, and they check different things:
+//!   * `tests::the_shader_formula_matches_core` transcribes the fragment maths into
+//!     Rust and compares against core over a grid. It runs in `cargo test` and needs
+//!     no GPU, but it never executes GLSL — it pins the *formula*, not this source.
+//!   * `examples/verify-adjust-shader.rs` runs this shader on the GPU through
+//!     `callback` and reads the framebuffer back. That one catches what the other
+//!     cannot: a typo in the source, a uniform never written, a quad in the wrong
+//!     place, a flipped `v_tc`. It needs a window, so it is a `cargo run --example`
+//!     rather than a test. Run it after touching anything below.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -301,7 +306,8 @@ mod tests {
     ///
     /// Deliberately a transcription rather than a tidy rewrite: it is only worth
     /// anything if a reader can hold it beside `FRAGMENT_SOURCE` and see that they
-    /// say the same thing.
+    /// say the same thing. What proves the GPU agrees is
+    /// `examples/verify-adjust-shader.rs`, not this.
     fn fragment(colour: [f32; 3], alpha: f32, adjust: Adjust) -> [f32; 3] {
         const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
 
