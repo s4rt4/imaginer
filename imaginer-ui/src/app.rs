@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use imaginer_core::image::RgbaImage;
-use imaginer_core::{Adjust, Decoded, Edits, Folder, Op, Stage, Stamp};
+use imaginer_core::{Adjust, Decoded, Edits, Folder, Op, Order, Stage, Stamp};
 
 use crate::icons::Icons;
 use crate::idle;
@@ -124,6 +124,12 @@ pub struct App {
     /// startup. Scanning a directory of thousands of files is real time, and a
     /// launch that only ever looks at the image it was given should not pay for it.
     folder: Option<Folder>,
+    /// What to sort a listing by. Held here rather than only inside `folder`,
+    /// because it has to outlive one: opening a different image throws the listing
+    /// away, and the order the user picked is not a property of the folder they
+    /// happened to be in when they picked it. Lasts the session — there is nowhere
+    /// to write a setting down yet.
+    order: Order,
     /// The pixels exactly as decoded, kept so every edit runs from the original
     /// rather than compounding on already-edited output. Behind an `Arc` because it
     /// is shared: with the edit worker, and with the cache entry it came from — so
@@ -209,6 +215,7 @@ impl App {
             last_zoom: 1.0,
             fullscreen: false,
             folder: None,
+            order: Order::DEFAULT,
             source: None,
             edits: Edits::default(),
             adjust: Adjust::NONE,
@@ -253,11 +260,24 @@ impl App {
     fn folder(&mut self) -> &mut Folder {
         if self.folder.is_none() {
             self.folder = Some(match self.path.as_deref() {
-                Some(path) => Folder::containing(path),
+                Some(path) => Folder::containing(path, self.order),
                 None => Folder::default(),
             });
         }
         self.folder.as_mut().expect("just filled in")
+    }
+
+    /// Re-order the folder listing.
+    ///
+    /// The image on screen does not change — `Folder::set_order` keeps the cursor on
+    /// it — but what comes next does, so the warmed neighbours are now the previous
+    /// order's and have to be asked for again.
+    fn set_order(&mut self, order: Order) {
+        self.order = order;
+        if let Some(folder) = self.folder.as_mut() {
+            folder.set_order(order);
+        }
+        self.warm_neighbours();
     }
 
     fn step(&mut self, ctx: &egui::Context, forward: bool) {
@@ -768,6 +788,7 @@ impl App {
         match action {
             toolbar::Action::Open => self.prompt_for_file(ctx),
             toolbar::Action::OpenFolder => self.prompt_for_folder(ctx),
+            toolbar::Action::Sort(order) => self.set_order(order),
             toolbar::Action::CopyPath => self.copy_path(),
             toolbar::Action::Delete => self.delete_current(ctx),
             toolbar::Action::ToggleFullscreen => self.set_fullscreen(ctx, !self.fullscreen),
@@ -1065,7 +1086,7 @@ impl App {
             return;
         };
 
-        let folder = imaginer_core::Folder::of_directory(&dir);
+        let folder = imaginer_core::Folder::of_directory(&dir, self.order);
         let Some(first) = folder.current().map(Path::to_path_buf) else {
             self.error = Some(format!(
                 "No images this build can open in {}",
@@ -1393,6 +1414,7 @@ impl eframe::App for App {
                             slideshow: self.slideshow.is_some(),
                             has_neighbours,
                             sidebar_open: self.sidebar_open,
+                            order: self.order,
                         },
                     );
                 });
@@ -1409,6 +1431,7 @@ impl eframe::App for App {
                             zoom: self.last_zoom,
                             file_size: self.stamp.as_ref().map(Stamp::file_size),
                             position: self.folder.as_ref().and_then(Folder::position),
+                            order: self.order,
                             error: self.error.as_deref(),
                             notice: self.notice.as_ref().map(|n| n.text.as_str()),
                         },

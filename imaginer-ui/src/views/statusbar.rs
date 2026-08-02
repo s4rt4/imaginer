@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use eframe::egui;
-use imaginer_core::Stage;
+use imaginer_core::{Order, SortKey, Stage};
 
 use crate::texture::ImageTexture;
 use crate::theme;
@@ -16,6 +16,8 @@ pub struct Status<'a> {
     pub file_size: Option<u64>,
     /// Where this image sits in its folder, 1-based, as `(position, total)`.
     pub position: Option<(usize, usize)>,
+    /// What that position is counting. Shown only when it is not the default.
+    pub order: Order,
     pub error: Option<&'a str>,
     /// Short-lived confirmation of an action, shown at the far end of the bar.
     pub notice: Option<&'a str>,
@@ -61,6 +63,14 @@ fn facts(ui: &mut egui::Ui, status: &Status<'_>) {
         // which of these am I looking at, and how many are left.
         if let Some((at, total)) = status.position {
             ui.colored_label(theme::TEXT_MUTED, format!("{at} / {total}"));
+
+            // Only when the order is not the plain A-to-Z the app starts in. A
+            // status bar that restates the default is one people stop reading — and
+            // "3 / 128" means something different under every other order, so that
+            // is exactly when it is worth the pixels.
+            if !status.order.is_default() {
+                ui.colored_label(theme::TEXT_MUTED, order_summary(status.order));
+            }
         }
 
         let Some(texture) = status.texture else {
@@ -100,6 +110,22 @@ fn facts(ui: &mut egui::Ui, status: &Status<'_>) {
 
 fn separator(ui: &mut egui::Ui) {
     ui.colored_label(theme::TEXT_MUTED, "·");
+}
+
+/// The order in words.
+///
+/// Words rather than an arrow beside the key: an arrow needs to be read as up or
+/// down and then translated into older or newer, and half the time it is translated
+/// wrong. It also needs a glyph, and this build loads exactly one system font.
+fn order_summary(order: Order) -> &'static str {
+    match (order.key, order.descending) {
+        (SortKey::Name, false) => "by name",
+        (SortKey::Name, true) => "by name, Z first",
+        (SortKey::Modified, false) => "by date, oldest first",
+        (SortKey::Modified, true) => "by date, newest first",
+        (SortKey::Size, false) => "by size, smallest first",
+        (SortKey::Size, true) => "by size, largest first",
+    }
 }
 
 fn human_size(bytes: u64) -> String {

@@ -6,6 +6,7 @@
 //! this row stay short enough to read at a glance.
 
 use eframe::egui;
+use imaginer_core::{Order, SortKey};
 
 use crate::icons::{self, Icon, Icons};
 use crate::views::viewer::ViewState;
@@ -16,6 +17,7 @@ use crate::views::viewer::ViewState;
 pub enum Action {
     Open,
     OpenFolder,
+    Sort(Order),
     CopyPath,
     Delete,
     ToggleFullscreen,
@@ -33,6 +35,8 @@ pub struct Bar {
     /// worth offering at all.
     pub has_neighbours: bool,
     pub sidebar_open: bool,
+    /// What the folder listing is currently ordered by.
+    pub order: Order,
 }
 
 /// Gap between buttons. Tighter than the app-wide spacing: a toolbar reads as
@@ -64,6 +68,14 @@ pub fn show(
         if icons::button(ui, icons, Icon::FolderOpen, "Open a folder (Ctrl+Shift+O)").clicked() {
             action = Some(Action::OpenFolder);
         }
+        // Beside the folder button rather than with the view controls: it changes
+        // what "next" means, which is a fact about the folder and not about how the
+        // image on screen is being looked at.
+        ui.add_enabled_ui(bar.has_neighbours, |ui| {
+            if let Some(order) = sort_menu(ui, icons, bar.order) {
+                action = Some(Action::Sort(order));
+            }
+        });
 
         separator(ui);
 
@@ -138,6 +150,40 @@ pub fn show(
     });
 
     action
+}
+
+/// The sort button and the little menu it opens.
+///
+/// The menu deliberately does **not** close when something in it is picked. Order is
+/// two choices, not one — "newest first" is Date and then Reverse — and a menu that
+/// shut after each would make that two trips. The listing re-sorts behind it as each
+/// is clicked, so the effect of a choice is visible while the next one is still
+/// under the pointer. Clicking away, or the button again, closes it.
+fn sort_menu(ui: &mut egui::Ui, icons: &mut Icons, order: Order) -> Option<Order> {
+    let mut chosen = None;
+
+    let button = icons::button(ui, icons, Icon::Sort, "Sort this folder");
+    egui::Popup::menu(&button).show(|ui| {
+        for key in SortKey::ALL {
+            if ui.selectable_label(key == order.key, key.label()).clicked() {
+                chosen = Some(Order { key, ..order });
+            }
+        }
+
+        ui.separator();
+
+        // A checkbox rather than an "ascending/descending" pair, because what
+        // "ascending" means changes with the key — for dates most people want the
+        // newest and could not tell you whether that is up or down.
+        if ui.selectable_label(order.descending, "Reverse").clicked() {
+            chosen = Some(Order {
+                descending: !order.descending,
+                ..order
+            });
+        }
+    });
+
+    chosen
 }
 
 /// A hairline between two groups of buttons.
