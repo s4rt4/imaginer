@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# What a failing golden-image test writes out beside the file it did not match, so
+# the two can be looked at side by side. Never the thing to commit — the fix is to
+# look, and then either mend the code or bless the golden.
+*.actual.png
