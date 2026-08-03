@@ -18,8 +18,16 @@ use crate::metadata::{self, Orientation};
 ///
 /// Mirrors the `image` feature list in `Cargo.toml` — a new format has to be added
 /// in both places. Everything that needs to ask "is this an image?" reads it from
-/// here: the open dialog's filter today, the folder listing next.
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+/// here: the open dialog's filter, the folder listing, and the shell integration's
+/// idea of which files to offer a Convert menu on.
+///
+/// Longer than the list of formats that can be *written*, which is
+/// [`crate::Format`]. That asymmetry is deliberate and is `image`'s: it ships more
+/// decoders than encoders, and offering a save format that then fails is worse than
+/// not offering it.
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "ff",
+];
 
 /// Whether `path` looks like something this build can open.
 ///
@@ -362,7 +370,78 @@ mod tests {
     fn recognises_supported_extensions_whatever_their_case() {
         assert!(is_supported(Path::new("holiday.JPG")));
         assert!(is_supported(Path::new("scan.png")));
+        assert!(is_supported(Path::new("scan.TIFF")));
+        assert!(is_supported(Path::new("app.ico")));
         assert!(!is_supported(Path::new("notes.txt")));
         assert!(!is_supported(Path::new("no-extension")));
+    }
+
+    /// Encode `img` in `format` into a temp file and decode it back.
+    fn round_trip(name: &str, format: image::ImageFormat, img: &image::DynamicImage) -> Decoded {
+        let path = temp_path(name);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, format).expect("encoding failed");
+        std::fs::write(&path, bytes.into_inner()).unwrap();
+
+        let decoded = decode_full(&path).expect("decoding failed");
+        std::fs::remove_file(&path).unwrap();
+        decoded
+    }
+
+    #[test]
+    fn reads_tiff() {
+        // What scanners and Photoshop write, and the reason this extension is on the
+        // list at all.
+        let src = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(6, 4, |x, y| {
+            image::Rgba([(x * 40) as u8, (y * 60) as u8, 90, 255])
+        }));
+        let decoded = round_trip("format.tiff", image::ImageFormat::Tiff, &src);
+
+        assert_eq!(decoded.size(), (6, 4));
+        assert_eq!(decoded.pixels.get_pixel(2, 1).0, [80, 60, 90, 255]);
+    }
+
+    #[test]
+    fn reads_farbfeld() {
+        // Farbfeld is 16 bits a channel and its encoder accepts nothing else, so the
+        // round trip is the interesting part: `0xABAB` has to come back as `0xAB`
+        // rather than as something a bit off.
+        let src = image::DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+            3,
+            2,
+            image::Rgba([0xabab, 0x1010, 0xffff, 0xffff]),
+        ));
+        let decoded = round_trip("format.ff", image::ImageFormat::Farbfeld, &src);
+
+        assert_eq!(decoded.size(), (3, 2));
+        assert_eq!(decoded.pixels.get_pixel(0, 0).0, [0xab, 0x10, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn reads_back_an_icon_this_crate_wrote() {
+        // The loop worth closing: the exporter's `.ico` is the output this project
+        // is measured on, and until now nothing here could open one. A file that
+        // Windows reads but this app cannot would be a poor advertisement for it.
+        // 256 square, so the file carries the one PNG-compressed entry as well as
+        // the BMP ladder below it — and it is the PNG entry a decoder is likeliest
+        // to choke on. A smaller source would skip it: the encoder never upscales.
+        let path = temp_path("written.ico");
+        let src =
+            image::RgbaImage::from_fn(256, 256, |x, y| image::Rgba([x as u8, y as u8, 128, 255]));
+        crate::export::write(
+            &src,
+            &path,
+            &crate::export::Settings {
+                format: crate::export::Format::Ico,
+                ..Default::default()
+            },
+        )
+        .expect("writing the icon failed");
+
+        // The largest entry in the ladder, which is what a decoder should pick.
+        let decoded = decode_full(&path).expect("decoding the icon failed");
+        assert_eq!(decoded.size(), (256, 256));
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

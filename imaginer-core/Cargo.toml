@@ -8,9 +8,11 @@ license.workspace = true
 # This crate must never gain a UI dependency. Decode, cache and edit logic live
 # here so they stay testable without spinning up a window.
 [dependencies]
-# Only the Phase 1 formats. `image`'s default feature set drags in AVIF encoding
-# (ravif), OpenEXR, TIFF and more — a large build-time and binary-size cost for
-# formats we do not ship yet. Add features here as phases land.
+# Named one by one rather than taking the default set, which drags in AVIF encoding
+# (ravif), OpenEXR and more — a large build-time and binary-size cost for formats
+# nothing here opens. Add features as phases land, and add the extension to
+# `decode::SUPPORTED_EXTENSIONS` in the same commit: a decoder nothing lists is a
+# decoder the open dialog and the folder listing both refuse to use.
 image = { version = "0.25.10", default-features = false, features = [
     "ico",
     "png",
@@ -18,6 +20,10 @@ image = { version = "0.25.10", default-features = false, features = [
     "gif",
     "bmp",
     "webp",
+    # Phase 3. TIFF is what scanners and Photoshop write; farbfeld costs almost
+    # nothing to carry, being a header and raw samples.
+    "tiff",
+    "ff",
 ] }
 kamadak-exif = "0.6.1"
 thiserror = "2.0.19"
