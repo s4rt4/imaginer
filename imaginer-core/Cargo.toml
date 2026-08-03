@@ -28,6 +28,13 @@ image = { version = "0.25.10", default-features = false, features = [
 kamadak-exif = "0.6.1"
 thiserror = "2.0.19"
 
+# SVG, which `image` does not do and never will — it is a renderer's job, not a
+# decoder's. Text is left on: an SVG whose lettering silently vanished would be a
+# wrong picture rather than an unsupported one, and this is a tool for people who
+# put type in their artwork. What that costs is fontdb, and it is loaded lazily on
+# the first SVG a session opens — never during startup. See `svg::system_fonts`.
+resvg = "0.47"
+
 # libwebp, for lossy WebP with a quality setting. `image` cannot encode WebP at all
 # and `image-webp` is lossless-only, and lossless defeats the point: the reason to
 # write WebP here is a smaller file for the web.

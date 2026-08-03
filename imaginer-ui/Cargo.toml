@@ -60,15 +60,12 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [build-dependencies]
-# Rasterises the logo SVGs at build time so the shipping binary carries pixels, not
-# an SVG renderer. `text` is off because the artwork is all paths -- that drops
-# fontdb and its font enumeration from the build entirely.
-resvg = { version = "0.47", default-features = false }
-
-# The `.ico` embedded as the executable's Win32 icon resource is written by our own
-# encoder rather than a second one kept in step by hand -- the SVG stays the single
-# source of truth, and the icon Explorer shows is the same code path the Convert
-# menu produces files with.
+# Everything the build script needs, and deliberately only this. The logo SVGs are
+# rasterised through `imaginer_core::Svg` and the embedded `.ico` is written by
+# `imaginer_core::export` -- the same code paths the running app uses, rather than
+# second copies kept in step by hand. It is also what keeps resvg to one
+# compilation: a separate build-dependency on it would resolve its own feature set
+# and be built again.
 imaginer-core = { path = "../imaginer-core" }
 
 [target.'cfg(windows)'.build-dependencies]

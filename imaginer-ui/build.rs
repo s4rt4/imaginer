@@ -1,14 +1,17 @@
 //! Rasterises the logo and UI-icon SVGs at build time.
 //!
-//! The alternative — rendering SVG at runtime — would mean carrying resvg in the
-//! shipping binary and paying for it during startup, which is the one thing this
-//! project is not willing to spend. Doing it here keeps the SVG as the source of
-//! truth (edit the artwork, rebuild, done) while the binary only ever sees a flat
-//! array of pixels it can hand straight to the window manager or the GPU.
+//! Still done here now that the app can render SVG at runtime, and for the reason
+//! that always applied: the chrome must not be *waiting* on a renderer. Doing it
+//! here keeps the SVG as the source of truth — edit the artwork, rebuild, done —
+//! while startup only ever sees a flat array of pixels to hand to the window
+//! manager or the GPU.
+//!
+//! The rendering itself goes through `imaginer_core::Svg`, the same path a user's
+//! own `.svg` takes. That is the rule the embedded `.ico` already follows, and it
+//! also means resvg is compiled once for this workspace rather than twice with
+//! different features.
 
 use std::path::{Path, PathBuf};
-
-use resvg::{tiny_skia, usvg};
 
 /// Window icon edge, in pixels. Windows asks for anything from 16px in the title bar
 /// to 256px in alt-tab; 128 downsamples cleanly to all of them without the weight of
@@ -213,43 +216,28 @@ struct Raster {
     rgba: Vec<u8>,
 }
 
+/// Rasterise one SVG to an exact width, with the height following its aspect ratio.
+///
+/// `render_width` rather than the viewer's `render_fit`: the packing code below is
+/// told a stride and every mask has to be exactly that wide.
+///
+/// Note that parsing loads the system fonts, since that is what the runtime path
+/// needs. It costs the build a couple of hundred milliseconds once. It would also
+/// make the output depend on the machine's fonts — but only for artwork containing
+/// `<text>`, and everything in `assets/` is paths. Convert type to outlines before
+/// adding artwork here.
 fn render(svg_path: &Path, target_width: u32) -> Raster {
     println!("cargo:rerun-if-changed={}", svg_path.display());
 
-    let svg = std::fs::read(svg_path)
+    let data = std::fs::read(svg_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", svg_path.display()));
-    let tree = usvg::Tree::from_data(&svg, &usvg::Options::default())
-        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", svg_path.display()));
-
-    // Scale uniformly from the SVG's own size so the artwork keeps its aspect ratio
-    // whatever the source viewBox happens to be.
-    let scale = target_width as f32 / tree.size().width();
-    let height = (tree.size().height() * scale).round().max(1.0) as u32;
-
-    let mut pixmap = tiny_skia::Pixmap::new(target_width, height)
-        .unwrap_or_else(|| panic!("invalid raster size {target_width}x{height}"));
-    resvg::render(
-        &tree,
-        tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
-
-    // tiny-skia composites in premultiplied alpha; undo that here rather than in the
-    // app, so the runtime never has to know how these pixels were produced.
-    let mut rgba = Vec::with_capacity(pixmap.pixels().len() * 4);
-    for pixel in pixmap.pixels() {
-        let demultiplied = pixel.demultiply();
-        rgba.extend_from_slice(&[
-            demultiplied.red(),
-            demultiplied.green(),
-            demultiplied.blue(),
-            demultiplied.alpha(),
-        ]);
-    }
+    let pixels = imaginer_core::Svg::parse(&data)
+        .and_then(|svg| svg.render_width(target_width))
+        .unwrap_or_else(|err| panic!("failed to rasterise {}: {err}", svg_path.display()));
 
     Raster {
-        width: target_width,
-        height,
-        rgba,
+        width: pixels.width(),
+        height: pixels.height(),
+        rgba: pixels.into_raw(),
     }
 }

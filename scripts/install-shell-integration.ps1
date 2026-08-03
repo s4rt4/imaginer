@@ -52,8 +52,10 @@ if (-not $Exe) {
 # simply gets no menu entry, which is a missing feature rather than a broken one.
 # .ico is on the list as a source: converting an existing icon to PNG or WebP is a
 # thing people want, and the app writes .ico either way.
+# .svg is the one worth having here above all: right-click a logo and get an .ico
+# or a WebP, which is the errand that sends people to an online converter.
 $extensions = @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp',
-                '.tif', '.tiff', '.ico', '.ff')
+                '.tif', '.tiff', '.ico', '.ff', '.svg', '.svgz')
 
 # What the submenu offers. The quality is fixed because a context menu has no room
 # for a slider: 90 is the CLI default and the point past which WebP and JPEG grow

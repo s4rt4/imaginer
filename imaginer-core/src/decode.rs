@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, Seek};
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -26,7 +26,7 @@ use crate::metadata::{self, Orientation};
 /// decoders than encoders, and offering a save format that then fails is worse than
 /// not offering it.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "ff",
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "ff", "svg", "svgz",
 ];
 
 /// Whether `path` looks like something this build can open.
@@ -56,6 +56,12 @@ pub enum DecodeError {
         path: String,
         #[source]
         source: image::ImageError,
+    },
+    #[error("could not render {path}: {source}")]
+    Svg {
+        path: String,
+        #[source]
+        source: crate::svg::SvgError,
     },
 }
 
@@ -225,6 +231,10 @@ pub fn decode_full(path: &Path) -> Result<Decoded, DecodeError> {
         path: path.display().to_string(),
         source,
     };
+    let svg_err = |source| DecodeError::Svg {
+        path: path.display().to_string(),
+        source,
+    };
 
     let mut reader = BufReader::new(File::open(path).map_err(io_err)?);
     let orientation = metadata::read_orientation(&mut reader);
@@ -232,11 +242,29 @@ pub fn decode_full(path: &Path) -> Result<Decoded, DecodeError> {
 
     // Detect by content rather than extension, so a mislabelled `.png` that is
     // really a JPEG still opens.
-    let img = image::ImageReader::new(&mut reader)
+    let probe = image::ImageReader::new(reader)
         .with_guessed_format()
-        .map_err(io_err)?
-        .decode()
-        .map_err(img_err)?;
+        .map_err(io_err)?;
+
+    let img = match probe.format() {
+        Some(_) => probe.decode().map_err(img_err)?,
+        // Nothing with a magic number. SVG is the only format here that has none —
+        // it is XML, and text has nothing to sniff for — so it belongs at the end
+        // as the fallback rather than as another guess in the queue. A file that is
+        // neither comes back as an SVG parse error, which is the more useful
+        // message anyway: `image` would only say it did not recognise the format.
+        None => {
+            let mut reader = probe.into_inner();
+            reader.rewind().map_err(io_err)?;
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data).map_err(io_err)?;
+
+            let rendered = crate::svg::Svg::parse(&data)
+                .and_then(|svg| svg.render_fit())
+                .map_err(svg_err)?;
+            image::DynamicImage::ImageRgba8(rendered)
+        }
+    };
 
     let img = orientation.apply(img);
     let full_size = (img.width(), img.height());
@@ -415,6 +443,43 @@ mod tests {
 
         assert_eq!(decoded.size(), (3, 2));
         assert_eq!(decoded.pixels.get_pixel(0, 0).0, [0xab, 0x10, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn reads_svg_and_draws_it_large_enough_to_look_at() {
+        // The one format with no magic number, so this also checks the fallback
+        // ordering: `image` finds nothing to recognise and hands the bytes on.
+        let path = temp_path("vector.svg");
+        std::fs::write(
+            &path,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12"
+                viewBox="0 0 24 12"><rect width="24" height="12" fill="lime"/></svg>"#,
+        )
+        .unwrap();
+
+        let decoded = decode_full(&path).expect("SVG should decode");
+        // 24 units wide would be a smudge; the longest side comes up to the floor.
+        assert_eq!(
+            decoded.size(),
+            (crate::svg::MIN_SIDE, crate::svg::MIN_SIDE / 2)
+        );
+        assert_eq!(decoded.pixels.get_pixel(100, 100).0, [0, 255, 0, 255]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_is_neither_raster_nor_svg_says_so() {
+        // The SVG fallback must not turn "unrecognised" into a blank image.
+        let path = temp_path("prose.svg");
+        std::fs::write(&path, b"just some words, not markup at all").unwrap();
+
+        assert!(matches!(
+            decode_full(&path).unwrap_err(),
+            DecodeError::Svg { .. }
+        ));
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod edit;
 pub mod export;
 pub mod folder;
 pub mod metadata;
+pub mod svg;
 
 pub use adjust::Adjust;
 pub use cache::{ImageCache, Stamp};
@@ -25,3 +26,4 @@ pub use edit::{Edits, Op};
 pub use export::{ExportError, Format, Settings as ExportSettings};
 pub use folder::{Folder, Order, SortKey};
 pub use metadata::{Info, Orientation};
+pub use svg::Svg;
