@@ -128,7 +128,9 @@ fn order_summary(order: Order) -> &'static str {
     }
 }
 
-fn human_size(bytes: u64) -> String {
+/// Bytes at whatever scale reads most easily. Shared with the info panel, so the
+/// two never describe the same file differently.
+pub fn human_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     let bytes = bytes as f64;
     if bytes < KB {

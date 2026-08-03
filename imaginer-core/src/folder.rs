@@ -140,11 +140,8 @@ impl Folder {
 
         let showing = self.current().map(Path::to_path_buf);
         sort(&mut self.entries, order);
-        self.current = showing.and_then(|path| {
-            self.entries
-                .iter()
-                .position(|entry| entry.path == path)
-        });
+        self.current =
+            showing.and_then(|path| self.entries.iter().position(|entry| entry.path == path));
     }
 
     pub fn current(&self) -> Option<&Path> {
@@ -379,7 +376,14 @@ mod tests {
         folder
             .entries
             .iter()
-            .map(|entry| entry.path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect()
     }
 
@@ -416,7 +420,11 @@ mod tests {
     fn size_order_runs_smallest_to_largest_and_back() {
         let dir = scratch_with(
             "size",
-            &[("big.png", 3000, 1), ("small.png", 10, 2), ("mid.png", 900, 3)],
+            &[
+                ("big.png", 3000, 1),
+                ("small.png", 10, 2),
+                ("mid.png", 900, 3),
+            ],
         );
 
         let up = Folder::of_directory(

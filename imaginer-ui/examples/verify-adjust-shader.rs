@@ -95,10 +95,7 @@ fn source() -> RgbaImage {
 }
 
 fn image_rect(canvas: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(
-        canvas.min + INSET,
-        egui::Vec2::splat(GRID as f32 * BLOCK),
-    )
+    egui::Rect::from_min_size(canvas.min + INSET, egui::Vec2::splat(GRID as f32 * BLOCK))
 }
 
 /// One frame of the window, as the GPU wrote it.
@@ -252,8 +249,14 @@ impl Verify {
         // covered the whole viewport would pass every colour check and fail this.
         for (where_, point) in [
             ("above left of it", frame.canvas.min + egui::vec2(4.0, 4.0)),
-            ("just past its right edge", egui::pos2(rect.right() + 4.0, rect.center().y)),
-            ("just below it", egui::pos2(rect.center().x, rect.bottom() + 4.0)),
+            (
+                "just past its right edge",
+                egui::pos2(rect.right() + 4.0, rect.center().y),
+            ),
+            (
+                "just below it",
+                egui::pos2(rect.center().x, rect.bottom() + 4.0),
+            ),
         ] {
             let Some(got) = frame.at(point) else {
                 continue;
@@ -272,8 +275,8 @@ impl Verify {
         for y in 0..GRID {
             for x in 0..GRID {
                 // The middle of the block this texel was magnified into.
-                let point = rect.min
-                    + egui::vec2((x as f32 + 0.5) * BLOCK, (y as f32 + 0.5) * BLOCK);
+                let point =
+                    rect.min + egui::vec2((x as f32 + 0.5) * BLOCK, (y as f32 + 0.5) * BLOCK);
                 let Some(got) = frame.at(point) else {
                     failure.get_or_insert(format!("texel {x},{y} landed outside the canvas"));
                     continue;
@@ -361,8 +364,7 @@ impl eframe::App for Verify {
                     texture.id(),
                     adjust,
                 ));
-                ui.painter()
-                    .add(readback(canvas, Arc::clone(&self.slot)));
+                ui.painter().add(readback(canvas, Arc::clone(&self.slot)));
             });
     }
 

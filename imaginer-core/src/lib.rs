@@ -24,4 +24,4 @@ pub use decode::{
 pub use edit::{Edits, Op};
 pub use export::{ExportError, Format, Settings as ExportSettings};
 pub use folder::{Folder, Order, SortKey};
-pub use metadata::Orientation;
+pub use metadata::{Info, Orientation};

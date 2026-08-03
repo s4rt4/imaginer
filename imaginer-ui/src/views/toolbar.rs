@@ -18,6 +18,7 @@ pub enum Action {
     Open,
     OpenFolder,
     Sort(Order),
+    ToggleInfo,
     CopyPath,
     Delete,
     ToggleFullscreen,
@@ -35,6 +36,7 @@ pub struct Bar {
     /// worth offering at all.
     pub has_neighbours: bool,
     pub sidebar_open: bool,
+    pub info_open: bool,
     /// What the folder listing is currently ordered by.
     pub order: Order,
 }
@@ -120,6 +122,17 @@ pub fn show(
 
         ui.add_enabled_ui(bar.has_image, |ui| {
             ui.spacing_mut().item_spacing.x = BUTTON_SPACING;
+
+            // First of the group that acts on the file rather than on the view: what
+            // this file *is* comes before anything done with it.
+            let tooltip = if bar.info_open {
+                "Close the info panel (I)"
+            } else {
+                "File and EXIF info (I)"
+            };
+            if icons::button(ui, icons, Icon::Info, tooltip).clicked() {
+                action = Some(Action::ToggleInfo);
+            }
 
             // `P`, not the Ctrl+Shift+C anyone would guess at: egui swallows every
             // Ctrl+C combination before the app can see it. See `handle_shortcuts`.

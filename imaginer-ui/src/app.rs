@@ -17,7 +17,7 @@ use crate::shader::AdjustShader;
 use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
 use crate::views::crop::CropState;
-use crate::views::{crop, sidebar, statusbar, toolbar, viewer};
+use crate::views::{crop, info, sidebar, statusbar, toolbar, viewer};
 use crate::{LoadMessage, clipboard, decode_into, theme, titlebar};
 
 /// How long a status-bar notice stays up. Long enough to read in passing, short
@@ -157,6 +157,12 @@ pub struct App {
     /// is on screen until then belongs to the previous one.
     awaiting_first_frame: bool,
     sidebar_open: bool,
+    info_open: bool,
+    /// What the EXIF block of the image on screen holds. Read when the info panel
+    /// first asks for it and kept until the image changes — `info_read` is what
+    /// tells "not looked at yet" apart from "looked, and there was none".
+    info: imaginer_core::Info,
+    info_read: bool,
     /// The crop being drawn, if the canvas is currently in that mode.
     crop: Option<CropState>,
     export: imaginer_core::ExportSettings,
@@ -228,6 +234,9 @@ impl App {
             painted: false,
             awaiting_first_frame: false,
             sidebar_open: false,
+            info_open: false,
+            info: imaginer_core::Info::default(),
+            info_read: false,
             crop: None,
             export,
             save_rx: std::sync::mpsc::channel().1,
@@ -328,6 +337,12 @@ impl App {
         self.edits.clear();
         self.adjust = Adjust::NONE;
         self.applying = false;
+
+        // The EXIF block describes the file it came out of, so it goes with it. Not
+        // read here: the panel is usually shut, and opening a file a second time to
+        // fill a panel nobody is looking at is work on the navigation path.
+        self.info = imaginer_core::Info::default();
+        self.info_read = false;
 
         // And so does a half-drawn crop: the selection is in image pixels, so left
         // alone it would hang over the next image at coordinates that mean nothing
@@ -682,7 +697,8 @@ impl App {
                     i.consume_key(NONE, Key::C),
                 )
             });
-        let enter = ctx.input_mut(|i| i.consume_key(NONE, Key::Enter));
+        let (enter, info) =
+            ctx.input_mut(|i| (i.consume_key(NONE, Key::Enter), i.consume_key(NONE, Key::I)));
 
         if escape {
             // Escape means "back out of where I am", and cropping is the innermost
@@ -750,7 +766,10 @@ impl App {
             self.push_op(ctx, Op::RotateCw);
         }
         if sidebar {
-            self.sidebar_open = !self.sidebar_open;
+            self.toggle_sidebar();
+        }
+        if info {
+            self.toggle_info();
         }
         if slideshow && self.has_neighbours() {
             self.toggle_slideshow();
@@ -789,11 +808,12 @@ impl App {
             toolbar::Action::Open => self.prompt_for_file(ctx),
             toolbar::Action::OpenFolder => self.prompt_for_folder(ctx),
             toolbar::Action::Sort(order) => self.set_order(order),
+            toolbar::Action::ToggleInfo => self.toggle_info(),
             toolbar::Action::CopyPath => self.copy_path(),
             toolbar::Action::Delete => self.delete_current(ctx),
             toolbar::Action::ToggleFullscreen => self.set_fullscreen(ctx, !self.fullscreen),
             toolbar::Action::ToggleSlideshow => self.toggle_slideshow(),
-            toolbar::Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
+            toolbar::Action::ToggleSidebar => self.toggle_sidebar(),
         }
     }
 
@@ -829,6 +849,49 @@ impl App {
         }
     }
 
+    /// Open the edit sidebar, and put the info panel away.
+    ///
+    /// The two are the same strip of window. Both at once would leave the
+    /// photograph a column down the middle, so opening either closes the other —
+    /// and there is no arrangement of the pair worth the width it would cost.
+    fn open_sidebar(&mut self) {
+        self.sidebar_open = true;
+        self.info_open = false;
+    }
+
+    fn toggle_sidebar(&mut self) {
+        match self.sidebar_open {
+            true => self.sidebar_open = false,
+            false => self.open_sidebar(),
+        }
+    }
+
+    fn toggle_info(&mut self) {
+        self.info_open = !self.info_open;
+        if self.info_open {
+            self.sidebar_open = false;
+        }
+    }
+
+    /// Read the EXIF block of the image on screen, once per image.
+    ///
+    /// Called from the frame that draws the panel rather than from the load, so a
+    /// session that never opens it never pays. The read itself is a file open and a
+    /// few kilobytes — noise beside the decode it sits next to, and nothing like
+    /// enough work to be worth a thread and a channel to report back on.
+    fn read_info(&mut self) {
+        if self.info_read {
+            return;
+        }
+        self.info_read = true;
+        self.info = match self.path.as_deref() {
+            Some(path) => imaginer_core::Info::read(path),
+            // Pixels from the clipboard were never a file, so there is no block to
+            // read. The panel still has the File section's shape to describe.
+            None => imaginer_core::Info::default(),
+        };
+    }
+
     /// Size of the image as the pipeline currently produces it, which is what a
     /// crop rectangle is measured against.
     fn edited_size(&self) -> Option<(u32, u32)> {
@@ -846,7 +909,7 @@ impl App {
         // starting a crop while zoomed into a corner would silently put most of the
         // image out of reach.
         self.view.reset();
-        self.sidebar_open = true;
+        self.open_sidebar();
         self.crop = Some(CropState::new(
             self.crop
                 .as_ref()
@@ -1414,6 +1477,7 @@ impl eframe::App for App {
                             slideshow: self.slideshow.is_some(),
                             has_neighbours,
                             sidebar_open: self.sidebar_open,
+                            info_open: self.info_open,
                             order: self.order,
                         },
                     );
@@ -1434,6 +1498,39 @@ impl eframe::App for App {
                             order: self.order,
                             error: self.error.as_deref(),
                             notice: self.notice.as_ref().map(|n| n.text.as_str()),
+                        },
+                    );
+                });
+        }
+
+        // Only over an image: with nothing on screen every row would be blank, and
+        // the panel would describe a file that is not open. Emptying the window —
+        // deleting the last image in a folder — therefore puts it away by itself,
+        // and opening another brings it back.
+        let mut info_action = None;
+        if self.info_open && self.texture.is_some() {
+            // Before the panel borrows anything, and only while it is open.
+            self.read_info();
+
+            egui::Panel::right(egui::Id::new("info"))
+                .exact_size(info::WIDTH)
+                .resizable(false)
+                .frame(egui::Frame::NONE.fill(theme::PANEL_BG))
+                .show(ui, |ui| {
+                    info_action = info::show(
+                        ui,
+                        &mut self.icons,
+                        &info::State {
+                            file: info::file_facts(
+                                self.path.as_deref(),
+                                self.stamp.as_ref().map(Stamp::file_size),
+                                // The decoded original, not the texture: this
+                                // section describes the file, and a rotate the user
+                                // has not saved has not changed what is on disk.
+                                self.source.as_ref().map(|source| source.dimensions()),
+                            ),
+                            exif: &self.info,
+                            ready: !self.loading,
                         },
                     );
                 });
@@ -1519,6 +1616,9 @@ impl eframe::App for App {
         }
         if let Some(action) = sidebar_action {
             self.apply_sidebar(&ctx, action);
+        }
+        if info_action == Some(info::Action::Close) {
+            self.info_open = false;
         }
         if let Some(step) = requested_step {
             self.step(&ctx, step == viewer::Step::Next);
