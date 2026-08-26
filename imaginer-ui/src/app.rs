@@ -17,7 +17,7 @@ use crate::shader::AdjustShader;
 use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
 use crate::views::crop::CropState;
-use crate::views::{crop, info, sidebar, statusbar, toolbar, viewer};
+use crate::views::{crop, info, sidebar, statusbar, timeline, toolbar, viewer};
 use crate::{LoadMessage, clipboard, decode_into, theme, titlebar};
 
 /// How long a status-bar notice stays up. Long enough to read in passing, short
@@ -150,6 +150,24 @@ pub struct App {
     applying: bool,
     /// When the slideshow should move on. `None` when it is not running.
     slideshow: Option<Instant>,
+    /// The remaining frames of an animated image, `None` for a still. `pixels` of
+    /// the current decode is this frame zero, so the first thing on screen is
+    /// frame one whether or not more follow.
+    animation: Option<Arc<imaginer_core::Animation>>,
+    /// Which animation frame is on screen right now.
+    anim_frame: usize,
+    /// Whether frames advance on their own. An animation arrives playing; pause
+    /// is what the user does to it.
+    anim_playing: bool,
+    /// When the frame on screen gives way to the next. `None` while paused —
+    /// same shape as `slideshow`, and ticked the same way, so idle CPU stays at
+    /// zero between frames of a paused or absent animation.
+    anim_due: Option<Instant>,
+    /// True while the timeline scrubber is being dragged, which holds playback.
+    scrubbing: bool,
+    /// What playback was doing when the drag started, so letting go resumes it
+    /// rather than leaving it stopped because the user touched the slider.
+    playing_before_scrub: bool,
     /// Set once a frame has been painted, which is when scanning the folder stops
     /// being something the user is waiting on.
     painted: bool,
@@ -231,6 +249,12 @@ impl App {
             edit_rx: std::sync::mpsc::channel().1,
             applying: false,
             slideshow: None,
+            animation: None,
+            anim_frame: 0,
+            anim_playing: false,
+            anim_due: None,
+            scrubbing: false,
+            playing_before_scrub: false,
             painted: false,
             awaiting_first_frame: false,
             sidebar_open: false,
@@ -338,6 +362,15 @@ impl App {
         self.adjust = Adjust::NONE;
         self.applying = false;
 
+        // So does an animation, and its playback with it: the next file starts
+        // paused on its own first frame until its decode says otherwise.
+        self.animation = None;
+        self.anim_frame = 0;
+        self.anim_playing = false;
+        self.anim_due = None;
+        self.scrubbing = false;
+        self.playing_before_scrub = false;
+
         // The EXIF block describes the file it came out of, so it goes with it. Not
         // read here: the panel is usually shut, and opening a file a second time to
         // fill a panel nobody is looking at is work on the navigation path.
@@ -356,11 +389,13 @@ impl App {
 
         // Prefetched or stepped back to, this image may already be decoded — in
         // which case it goes up in this very frame. No thread, no second frame, and
-        // none of the wait that makes walking a folder feel slow.
+        // none of the wait that makes walking a folder feel slow. Asking with the
+        // frame set in mind: a still that prefetch stored for an animated file is
+        // not good enough here, and the miss re-decodes it whole.
         let ready = self
             .stamp
             .as_ref()
-            .and_then(|stamp| self.prefetch.cached(&path, stamp));
+            .and_then(|stamp| self.prefetch.cached(&path, stamp, true));
 
         self.nav.asked(ready.is_some());
 
@@ -406,6 +441,7 @@ impl App {
                 // resolved any rotation into the pixels themselves.
                 orientation: imaginer_core::Orientation::Normal,
                 full_size,
+                animation: None,
             },
         );
 
@@ -426,9 +462,15 @@ impl App {
 
     /// Put decoded pixels on screen, and keep them for the next time this image is
     /// asked for.
+    ///
+    /// Called once per decode message, which for an animated file is twice at full
+    /// resolution: first the still — frame one — so something correct is up fast,
+    /// then the whole frame set, which swaps in without touching layout because it
+    /// has the very same canvas size.
     fn accept(&mut self, ctx: &egui::Context, decoded: Decoded) {
         let name = format!("image-{}", self.texture_generation);
         let stage = decoded.stage;
+        let animation = decoded.animation.clone();
         self.stage = Some(stage);
         self.texture = Some(texture::upload(ctx, &name, &decoded));
         self.error = None;
@@ -439,14 +481,16 @@ impl App {
             self.awaiting_first_frame = false;
             self.view.reset();
         }
-        // A preview means the full decode is still coming — and a full one means
-        // nothing is, whether it arrived on a thread or straight from the cache.
-        self.loading = stage == Stage::Preview;
 
         // Editing needs the real pixels; a thumbnail stand-in would produce a
         // preview at the wrong resolution and an export at the wrong one entirely.
         if stage == Stage::Full {
-            self.nav.arrived(self.path.as_deref());
+            // The nav trace reports one line per image shown, and the frame set
+            // that follows a still belongs to that same arrival — `source` being
+            // set already says this image made it to the screen once.
+            if self.source.is_none() {
+                self.nav.arrived(self.path.as_deref());
+            }
             self.source = Some(Arc::clone(&decoded.pixels));
 
             // Into the cache as well, so stepping back to it is as free as stepping
@@ -456,6 +500,19 @@ impl App {
             if let (Some(path), Some(stamp)) = (self.path.clone(), self.stamp.clone()) {
                 self.prefetch.store(path, stamp, decoded);
             }
+        }
+
+        // An animated decode starts playing the moment it lands; anything else
+        // leaves playback parked. Frame zero is what was just uploaded — `pixels`
+        // *is* frame zero — so arming the deadline is all starting takes.
+        self.animation = animation;
+        self.anim_frame = 0;
+        if let Some(anim) = self.animation.as_ref() {
+            self.anim_playing = true;
+            self.anim_due = Some(Instant::now() + anim.delays[0]);
+        } else {
+            self.anim_playing = false;
+            self.anim_due = None;
         }
     }
 
@@ -476,9 +533,109 @@ impl App {
                 }
                 Err(TryRecvError::Empty) => break,
                 // Sender gone with nothing more to say — the decode finished.
+                // `loading` means "a decode channel is still alive", so it ends
+                // here and only here: an animated file sends a second message
+                // after its first full decode, and treating either message as the
+                // last would strand the frame set in the channel.
                 Err(TryRecvError::Disconnected) => {
                     self.loading = false;
                     break;
+                }
+            }
+        }
+    }
+
+    /// Swap the texture over to animation frame `index` without re-fitting.
+    ///
+    /// Also moves `source` onto that frame, which is what makes edits, copy and
+    /// save act on the picture actually on screen rather than on whichever frame
+    /// was showing when the file opened.
+    fn display_frame(&mut self, ctx: &egui::Context, index: usize) {
+        let Some(anim) = self.animation.as_ref() else {
+            return;
+        };
+        let index = index.min(anim.len() - 1);
+        self.anim_frame = index;
+        let frame = Arc::clone(&anim.frames[index]);
+
+        if let Some(tex) = self.texture.as_mut() {
+            texture::set_pixels(ctx, tex, &frame);
+        }
+        self.source = Some(frame);
+    }
+
+    /// Pause playback. The frame on screen stays until the user does something.
+    fn pause_animation(&mut self) {
+        self.anim_playing = false;
+        self.anim_due = None;
+    }
+
+    /// Resume (or start) playback from the frame currently on screen.
+    fn play_animation(&mut self, ctx: &egui::Context) {
+        let Some(anim) = self.animation.as_ref() else {
+            return;
+        };
+        if anim.len() < 2 {
+            return;
+        }
+        self.anim_playing = true;
+        let delay = anim.delays[self.anim_frame.min(anim.len() - 1)];
+        self.anim_due = Some(Instant::now() + delay);
+        ctx.request_repaint_after(delay);
+    }
+
+    /// Advance one frame when its time is up, and keep frames coming until it is.
+    ///
+    /// The same shape as `tick_slideshow`: schedule a repaint for the deadline and
+    /// do the work when it fires, so a playing animation costs no frames beyond
+    /// its own frame rate and a paused one costs none at all.
+    fn tick_animation(&mut self, ctx: &egui::Context) {
+        if !self.anim_playing || self.scrubbing {
+            return;
+        }
+        let Some(due) = self.anim_due else {
+            return;
+        };
+
+        let now = Instant::now();
+        if now < due {
+            ctx.request_repaint_after(due - now);
+            return;
+        }
+
+        let Some(anim) = self.animation.as_ref() else {
+            return;
+        };
+        let count = anim.len();
+        let next = (self.anim_frame + 1) % count.max(1);
+        let delay = anim.delays[next.min(count - 1)];
+        self.display_frame(ctx, next);
+        self.anim_due = Some(now + delay);
+        ctx.request_repaint_after(delay);
+    }
+
+    fn apply_timeline(&mut self, ctx: &egui::Context, action: timeline::Action) {
+        match action {
+            timeline::Action::TogglePlay => {
+                if self.anim_playing {
+                    self.pause_animation();
+                } else {
+                    self.play_animation(ctx);
+                }
+            }
+            timeline::Action::ScrubStart => {
+                self.scrubbing = true;
+                self.playing_before_scrub = self.anim_playing;
+                self.pause_animation();
+            }
+            timeline::Action::Scrub(index) => {
+                self.pause_animation();
+                self.display_frame(ctx, index);
+            }
+            timeline::Action::ScrubEnd => {
+                self.scrubbing = false;
+                if self.playing_before_scrub {
+                    self.play_animation(ctx);
                 }
             }
         }
@@ -528,6 +685,12 @@ impl App {
         let Some(source) = self.source.clone() else {
             return;
         };
+
+        // Geometry edits bake into the texture, which playback would overwrite
+        // with unedited frames on its next advance — so an op pauses the film.
+        // (Colour is different: the shader applies it at draw time, so sliders
+        // keep working live over a playing animation.)
+        self.pause_animation();
         let edits = self.edits.clone();
 
         // The sliders follow the stack, which is what makes undoing an adjustment
@@ -771,8 +934,20 @@ impl App {
         if info {
             self.toggle_info();
         }
-        if slideshow && self.has_neighbours() {
-            self.toggle_slideshow();
+        // Space means "stop/start the thing that is moving": an animation's
+        // playback when there is one, otherwise the slideshow. The two never run
+        // as one — stepping to a still mid-slideshow keeps the slideshow, and an
+        // animated file plays whether or not it has neighbours.
+        if slideshow {
+            if self.animation.is_some() {
+                if self.anim_playing {
+                    self.pause_animation();
+                } else {
+                    self.play_animation(ctx);
+                }
+            } else if self.has_neighbours() {
+                self.toggle_slideshow();
+            }
         }
         if start_crop {
             self.start_crop();
@@ -1297,6 +1472,9 @@ impl App {
                 self.stage = None;
                 self.stamp = None;
                 self.loading = false;
+                self.animation = None;
+                self.anim_playing = false;
+                self.anim_due = None;
                 self.view.reset();
             }
         }
@@ -1447,6 +1625,9 @@ impl eframe::App for App {
         self.interrupt_slideshow(&ctx);
         self.handle_dropped_files(&ctx);
         self.handle_shortcuts(&ctx);
+        // After the shortcuts: a Space that pauses must not be immediately
+        // followed by a tick that plays again in the same frame.
+        self.tick_animation(&ctx);
         self.tick_slideshow(&ctx);
 
         // Fullscreen means the photograph, not a photograph with a toolbar over it.
@@ -1571,6 +1752,7 @@ impl eframe::App for App {
         }
 
         let mut requested_step = None;
+        let mut requested_timeline = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::CANVAS_BG))
             .show(ui, |ui| {
@@ -1599,6 +1781,24 @@ impl eframe::App for App {
                         }
                         None => {}
                     }
+
+                    // The playback bar belongs beside the chevrons: on the canvas,
+                    // with the chrome. Cropping hides it along with everything else
+                    // that acts on the image as a whole.
+                    if self.crop.is_none() {
+                        let count = self.animation.as_ref().map_or(0, |anim| anim.len());
+                        requested_timeline = timeline::show(
+                            ui,
+                            &mut self.icons,
+                            canvas,
+                            timeline::Playback {
+                                frame: self.anim_frame,
+                                count,
+                                playing: self.anim_playing,
+                            },
+                            show_chrome,
+                        );
+                    }
                     self.trace.mark_first_image();
                 } else {
                     let logotype = self
@@ -1622,6 +1822,9 @@ impl eframe::App for App {
         }
         if let Some(step) = requested_step {
             self.step(&ctx, step == viewer::Step::Next);
+        }
+        if let Some(action) = requested_timeline {
+            self.apply_timeline(&ctx, action);
         }
 
         self.trace.mark_first_frame();

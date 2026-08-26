@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use imaginer_core::{Decoded, decode_full, decode_preview};
+use imaginer_core::{Decoded, decode_full, decode_full_static, decode_preview};
 
 /// What the decode thread sends back to the UI.
 pub enum LoadMessage {
@@ -153,6 +153,13 @@ fn flag_disabled(name: &str) -> bool {
 
 /// Decode in two passes: the embedded EXIF thumbnail first if there is one, then
 /// the real image. The viewer shows whichever arrives first.
+///
+/// For an animated file the full decode is itself split in two, and for the same
+/// reason the thumbnail is: a GIF's whole frame set can take far longer to decode
+/// than its first frame, and a window that waits for all of it before painting
+/// anything is exactly what this startup exists to avoid. So the still arrives as
+/// an ordinary `Loaded` and plays nothing; the frame set follows as a second
+/// message for the same image, which the viewer swaps in without touching layout.
 fn decode_into(path: PathBuf, tx: &mpsc::Sender<LoadMessage>) {
     if let Some(preview) = decode_preview(&path) {
         // A dropped receiver just means the window closed; stop rather than
@@ -162,9 +169,17 @@ fn decode_into(path: PathBuf, tx: &mpsc::Sender<LoadMessage>) {
         }
     }
 
-    let message = match decode_full(&path) {
+    let message = match decode_full_static(&path) {
         Ok(decoded) => LoadMessage::Loaded(decoded),
         Err(err) => LoadMessage::Failed(err.to_string()),
     };
-    let _ = tx.send(message);
+    if tx.send(message).is_err() {
+        return;
+    }
+
+    if let Ok(animated) = decode_full(&path)
+        && animated.animation.is_some()
+    {
+        let _ = tx.send(LoadMessage::Loaded(animated));
+    }
 }

@@ -6,11 +6,14 @@
 //! decode at all), and [`decode_full`] does the real work afterwards. The viewer
 //! shows whichever arrives first and swaps in the full image when it lands.
 
+use image::AnimationDecoder;
+
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::metadata::{self, Orientation};
 
@@ -74,6 +77,50 @@ pub enum Stage {
     Full,
 }
 
+/// The frames of an animated GIF or WebP, each already composited to the full
+/// canvas size.
+///
+/// Both codecs hand back whole pictures — `image`'s GIF path applies disposal
+/// methods and blends sub-rectangles onto the canvas itself, and image-webp does
+/// its own blending inside `read_frame` — so a frame here is exactly what belongs
+/// on screen, with no further compositing anywhere else. That is what makes random
+/// access cheap enough for a timeline scrub: any frame can go straight to the GPU.
+pub struct Animation {
+    /// At least one frame. `frames[0]` is shared with the `Decoded` that carries
+    /// this animation, so showing frame zero costs nothing extra.
+    pub frames: Vec<Arc<image::RgbaImage>>,
+    /// How long each frame is shown. Same length as `frames`.
+    pub delays: Vec<Duration>,
+}
+
+impl Animation {
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Memory the whole frame set occupies, which is what the cache budgets
+    /// against. An animation's cost is all of its frames, not just the one on
+    /// screen — undercounting would let one long GIF quietly hold more than the
+    /// budget says.
+    pub fn byte_size(&self) -> usize {
+        self.frames.iter().map(|f| f.as_raw().len()).sum()
+    }
+}
+
+// Hand-written for the same reason as `Decoded`'s below.
+impl std::fmt::Debug for Animation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Animation")
+            .field("frames", &self.frames.len())
+            .field("delays", &self.delays.len())
+            .finish()
+    }
+}
+
 /// A decoded image, already rotated per EXIF and in the RGBA8 layout the GPU wants.
 ///
 /// Cheap to clone, which is what lets the cache hand the same image to the viewer
@@ -91,6 +138,11 @@ pub struct Decoded {
     /// viewer can lay out and set the zoom level correctly before the full decode
     /// arrives — no layout jump when it swaps in.
     pub full_size: (u32, u32),
+    /// The remaining frames when the file turned out to be animated. `pixels` is
+    /// always its first frame, so every static code path — viewer layout, edit
+    /// pipeline, export — keeps working unchanged on an animation; it simply acts
+    /// on the frame that is showing. `None` for stills and for previews.
+    pub animation: Option<Arc<Animation>>,
 }
 
 impl Decoded {
@@ -107,9 +159,13 @@ impl Decoded {
     /// How much memory the pixels occupy, which is what the cache budgets against.
     ///
     /// The buffer itself, not `size_of` the struct: everything else here is a
-    /// handful of bytes beside it.
+    /// handful of bytes beside it. For an animation that means every frame —
+    /// `pixels` alone would undercount by all but one.
     pub fn byte_size(&self) -> usize {
-        self.pixels.as_raw().len()
+        match &self.animation {
+            Some(animation) => animation.byte_size(),
+            None => self.pixels.as_raw().len(),
+        }
     }
 
     /// Pixels ready to hand to the GPU, downscaled if the image is larger than the
@@ -166,6 +222,10 @@ impl std::fmt::Debug for Decoded {
             .field("stage", &self.stage)
             .field("orientation", &self.orientation)
             .field("full_size", &self.full_size)
+            .field(
+                "animation_frames",
+                &self.animation.as_ref().map(|a| a.len()),
+            )
             .finish()
     }
 }
@@ -211,6 +271,7 @@ pub fn decode_preview(path: &Path) -> Option<Decoded> {
         stage: Stage::Preview,
         orientation,
         full_size,
+        animation: None,
     })
 }
 
@@ -222,7 +283,26 @@ fn thumbnail_field(exif: &exif::Exif, tag: exif::Tag) -> Option<usize> {
 }
 
 /// Fully decode an image at native resolution, corrected for EXIF orientation.
+///
+/// Animated GIFs and WebPs come back with their whole frame set attached; see
+/// [`Decoded::animation`]. Prefetch uses [`decode_full_static`] instead, because
+/// decoding every frame of a neighbour nobody is looking at yet is exactly the
+/// work prefetch exists to avoid doing twice.
 pub fn decode_full(path: &Path) -> Result<Decoded, DecodeError> {
+    decode_impl(path, true)
+}
+
+/// Like [`decode_full`], but never decodes animation frames.
+///
+/// For the still image only — frame one of an animated file, no `Animation`
+/// attached. The prefetch thread calls this: it warms neighbours nobody has asked
+/// to *play* yet, and paying for every frame of every GIF in a folder would make
+/// prefetching them more expensive than not prefetching at all.
+pub fn decode_full_static(path: &Path) -> Result<Decoded, DecodeError> {
+    decode_impl(path, false)
+}
+
+fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError> {
     let io_err = |source| DecodeError::Io {
         path: path.display().to_string(),
         source,
@@ -245,6 +325,23 @@ pub fn decode_full(path: &Path) -> Result<Decoded, DecodeError> {
     let probe = image::ImageReader::new(reader)
         .with_guessed_format()
         .map_err(io_err)?;
+
+    // The two animated formats take a different road from here: their decoder has
+    // to be driven frame by frame, and the generic `decode()` below would throw the
+    // rest of the file away after the first one. There is no falling back out of
+    // this branch — a GIF that turns out to hold a single frame comes back as an
+    // ordinary still from the same code, just without an `Animation` attached.
+    if want_animation
+        && matches!(
+            probe.format(),
+            Some(image::ImageFormat::Gif) | Some(image::ImageFormat::WebP)
+        )
+    {
+        let format = probe.format().expect("checked above");
+        let mut reader = probe.into_inner();
+        reader.rewind().map_err(io_err)?;
+        return decode_animation(&mut reader, format, orientation);
+    }
 
     let img = match probe.format() {
         Some(_) => probe.decode().map_err(img_err)?,
@@ -274,7 +371,155 @@ pub fn decode_full(path: &Path) -> Result<Decoded, DecodeError> {
         stage: Stage::Full,
         orientation,
         full_size,
+        animation: None,
     })
+}
+
+/// Above this many decoded frame bytes an animation is treated as a still.
+///
+/// A viewer's job is to show what is on disk, not to swap for it; but a
+/// multi-hundred-frame animation at screen resolution can outrun the entire cache
+/// budget on its own, and one file that evicts everything else it meets is a worse
+/// outcome than a file that plays only its first frame. The cap lands far above
+/// anything made to be watched — it is there for the pathological case.
+const MAX_ANIMATION_BYTES: usize = 512 * 1024 * 1024;
+
+/// Browsers treat a GIF delay of 10ms or less as "as fast as the author dared",
+/// which historically meant broken encoders writing zero. Playing those at face
+/// value strobes; everyone settles them at 100ms, so that is what happens here.
+const MIN_EFFECTIVE_DELAY: Duration = Duration::from_millis(10);
+const FALLEN_BACK_DELAY: Duration = Duration::from_millis(100);
+
+fn effective_delay(delay: image::Delay) -> Duration {
+    // `Delay` holds a rational whose unit is already milliseconds; integer
+    // division of a small ratio loses nothing.
+    let (numer, denom) = delay.numer_denom_ms();
+    let duration = Duration::from_millis(u64::from(numer) / u64::from(denom.max(1)));
+    if duration <= MIN_EFFECTIVE_DELAY {
+        FALLEN_BACK_DELAY
+    } else {
+        duration
+    }
+}
+
+/// Decode every frame of an animated GIF or WebP, composited to full canvas size.
+///
+/// Always answers with a [`Decoded`]: animated when there is more than one frame,
+/// an ordinary still when there is not — so callers never re-decode a single-frame
+/// GIF through the static path. A file whose tail will not decode, or whose frames
+/// together would blow [`MAX_ANIMATION_BYTES`], still comes back whole: the frames
+/// gathered so far are kept and the `Animation` dropped, because half an animation
+/// loops wrong but its first frame is always correct.
+///
+/// All frames are held in memory on purpose. Scrubbing needs random access, and
+/// neither codec offers seek-to-frame — the iterator is forward-only — so the only
+/// way to jump backwards is to have already been there.
+fn decode_animation<R: BufRead + Seek>(
+    reader: &mut R,
+    format: image::ImageFormat,
+    orientation: Orientation,
+) -> Result<Decoded, DecodeError> {
+    /// What collecting a file's frames produced.
+    struct Collected {
+        frames: Vec<Arc<image::RgbaImage>>,
+        delays: Vec<Duration>,
+        /// False when collecting stopped early — a frame failed mid-file, or the
+        /// byte cap was hit. A partial frame set must not animate: looping it
+        /// would play the head of an animation whose tail is missing.
+        complete: bool,
+    }
+
+    fn collect(frames: impl Iterator<Item = image::ImageResult<image::Frame>>) -> Collected {
+        let mut out = Collected {
+            frames: Vec::new(),
+            delays: Vec::new(),
+            complete: true,
+        };
+        for frame in frames {
+            let Ok(frame) = frame else {
+                out.complete = false;
+                break;
+            };
+            let delay = effective_delay(frame.delay());
+            out.frames.push(Arc::new(frame.into_buffer()));
+            out.delays.push(delay);
+            // Not an error — the frames so far are fine — but there is no point
+            // decoding further into a set that will be dropped whole below.
+            if out.frames.iter().map(|f| f.as_raw().len()).sum::<usize>() > MAX_ANIMATION_BYTES {
+                out.complete = false;
+                break;
+            }
+        }
+        out
+    }
+
+    fn image_error(source: impl Into<image::ImageError>) -> DecodeError {
+        DecodeError::Image {
+            path: String::new(),
+            source: source.into(),
+        }
+    }
+
+    let Collected {
+        frames,
+        delays,
+        complete,
+    } = match format {
+        image::ImageFormat::Gif => collect(
+            image::codecs::gif::GifDecoder::new(reader)
+                .map_err(image_error)?
+                .into_frames(),
+        ),
+        _ => collect(
+            image::codecs::webp::WebPDecoder::new(reader)
+                .map_err(image_error)?
+                .into_frames(),
+        ),
+    };
+
+    if frames.is_empty() {
+        // Nothing decoded at all. With no pixels there is nothing to show, so a
+        // failure — however bland — is the honest answer.
+        return Err(image_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no decodable frames",
+        )));
+    }
+
+    let apply = |frame: &Arc<image::RgbaImage>| -> Arc<image::RgbaImage> {
+        if orientation == Orientation::Normal {
+            Arc::clone(frame)
+        } else {
+            Arc::new(
+                orientation
+                    .apply(image::DynamicImage::ImageRgba8((**frame).clone()))
+                    .into_rgba8(),
+            )
+        }
+    };
+
+    // The first frame's size is the canvas size both codecs composite to.
+    let full_size = (frames[0].width(), frames[0].height());
+
+    if frames.len() > 1 && complete {
+        let frames: Vec<_> = frames.iter().map(apply).collect();
+        let pixels = Arc::clone(&frames[0]);
+        Ok(Decoded {
+            pixels,
+            stage: Stage::Full,
+            orientation,
+            full_size,
+            animation: Some(Arc::new(Animation { frames, delays })),
+        })
+    } else {
+        Ok(Decoded {
+            pixels: apply(&frames[0]),
+            stage: Stage::Full,
+            orientation,
+            full_size,
+            animation: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +608,7 @@ mod tests {
             stage: Stage::Full,
             orientation: Orientation::Normal,
             full_size: (64, 16),
+            animation: None,
         };
 
         let (w, h, bytes) = decoded.for_upload(16384);
@@ -506,6 +752,118 @@ mod tests {
         // The largest entry in the ladder, which is what a decoder should pick.
         let decoded = decode_full(&path).expect("decoding the icon failed");
         assert_eq!(decoded.size(), (256, 256));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Write a GIF whose frames are solid rectangles of the given colours, each
+    /// held on screen for `delay_ms`, and return its path. Frames after the first
+    /// get a dark corner pixel, so a test can tell which frame it is looking at.
+    fn animated_gif(name: &str, colours: &[[u8; 4]], delays_ms: &[u32]) -> std::path::PathBuf {
+        let path = temp_path(name);
+        let mut encoder = image::codecs::gif::GifEncoder::new(File::create(&path).unwrap());
+        for ((index, colour), delay_ms) in colours.iter().enumerate().zip(delays_ms) {
+            let mut buffer = image::RgbaImage::from_pixel(6, 4, image::Rgba(*colour));
+            if index > 0 {
+                buffer.put_pixel(0, 0, image::Rgba([9, 9, 9, 255]));
+            }
+            encoder
+                .encode_frame(image::Frame::from_parts(
+                    buffer,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(*delay_ms, 1),
+                ))
+                .unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn an_animated_gif_comes_back_with_its_frames() {
+        let path = animated_gif(
+            "anim.gif",
+            &[[255, 0, 0, 255], [0, 0, 255, 255]],
+            &[200, 200],
+        );
+
+        let decoded = decode_full(&path).unwrap();
+        let animation = decoded.animation.as_ref().expect("should be animated");
+        assert_eq!(animation.len(), 2);
+        // Both frames composite to the canvas size, never to a sub-rectangle.
+        assert!(animation.frames.iter().all(|f| f.dimensions() == (6, 4)));
+        // `pixels` is frame zero — the thing every static code path acts on.
+        assert_eq!(decoded.pixels.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(
+            animation.frames[1].get_pixel(0, 0).0,
+            [9, 9, 9, 255],
+            "frame identity must survive the round trip"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn animation_bytes_are_counted_across_every_frame() {
+        let path = animated_gif(
+            "anim-bytes.gif",
+            &[[1, 2, 3, 255], [4, 5, 6, 255]],
+            &[200, 200],
+        );
+
+        let decoded = decode_full(&path).unwrap();
+        let per_frame = 6 * 4 * 4;
+        assert_eq!(decoded.byte_size(), per_frame * 2);
+
+        // The static decode of the same file carries no frame set at all —
+        // prefetch must not pay twice for pixels it cannot play yet.
+        let static_only = decode_full_static(&path).unwrap();
+        assert!(static_only.animation.is_none());
+        assert_eq!(static_only.byte_size(), per_frame);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_single_frame_gif_is_a_still_not_an_animation() {
+        let path = animated_gif("one.gif", &[[7, 7, 7, 255]], &[100]);
+
+        let decoded = decode_full(&path).unwrap();
+        assert!(decoded.animation.is_none());
+        assert_eq!(decoded.size(), (6, 4));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_broken_gif_tail_still_shows_its_head_as_a_still() {
+        let path = animated_gif("tail.gif", &[[1, 1, 1, 255], [2, 2, 2, 255]], &[200, 200]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 3); // into the last frame's data block
+
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Half an animation loops wrong; its first frame is always right.
+        let decoded = decode_full(&path).unwrap();
+        assert!(
+            decoded.animation.is_none(),
+            "a truncated frame set must not animate"
+        );
+        assert_eq!(decoded.size(), (6, 4));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn gif_delays_of_ten_ms_or_less_settle_at_one_hundred() {
+        // Zero-delay GIFs are a broken-encoder convention for "as fast as you can";
+        // browsers all settle them at 100ms because face value strobes.
+        let path = animated_gif("fast.gif", &[[1, 1, 1, 255], [2, 2, 2, 255]], &[8, 300]);
+
+        let decoded = decode_full(&path).unwrap();
+        let delays = decoded.animation.as_ref().unwrap().delays.clone();
+        assert_eq!(delays[0], Duration::from_millis(100));
+        assert_eq!(delays[1], Duration::from_millis(300));
 
         std::fs::remove_file(&path).unwrap();
     }

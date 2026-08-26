@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use imaginer_core::cache::{ImageCache, Stamp};
-use imaginer_core::{Decoded, decode_full};
+use imaginer_core::{Decoded, decode_full_static};
 
 /// One request: the images to warm, in the order they should be warmed.
 type Job = Vec<PathBuf>;
@@ -56,8 +56,11 @@ impl Prefetcher {
 
     /// The decoded image for `path`, if it is already in hand and still matches the
     /// file on disk.
-    pub fn cached(&self, path: &Path, stamp: &Stamp) -> Option<Decoded> {
-        self.lock().get(path, stamp)
+    ///
+    /// `want_animation` passes through to the cache: the viewer asking for frames
+    /// must not be answered with a still that prefetch happened to store first.
+    pub fn cached(&self, path: &Path, stamp: &Stamp, want_animation: bool) -> Option<Decoded> {
+        self.lock().get(path, stamp, want_animation)
     }
 
     /// Keep a decode the viewer did itself, so stepping back to it is free.
@@ -132,14 +135,19 @@ fn warm_one(path: &Path, cache: &Mutex<ImageCache>) {
     let Some(stamp) = Stamp::of(path) else {
         return;
     };
-    if lock(cache).holds(path, &stamp) {
+    if lock(cache).holds(path, &stamp, false) {
         return;
     }
 
     // Outside the lock, on purpose. This is the slow part, and holding the cache
     // across it would stall the UI thread on its own lookups — turning a prefetch
     // meant to remove a wait into one that causes it.
-    let Ok(decoded) = decode_full(path) else {
+    //
+    // Static decode: an animated neighbour is warmed as its first frame only.
+    // Decoding every frame of every GIF beside the cursor would make prefetching
+    // animations cost more than not prefetching them; when the viewer actually
+    // lands on one it asks for the frame set itself and replaces this entry.
+    let Ok(decoded) = decode_full_static(path) else {
         return;
     };
 
@@ -180,7 +188,7 @@ mod tests {
     fn cached_within(prefetch: &Prefetcher, path: &Path, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if Stamp::of(path).is_some_and(|stamp| prefetch.cached(path, &stamp).is_some()) {
+            if Stamp::of(path).is_some_and(|stamp| prefetch.cached(path, &stamp, false).is_some()) {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(5));

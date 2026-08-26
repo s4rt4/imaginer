@@ -20,7 +20,8 @@ pub use adjust::Adjust;
 pub use cache::{ImageCache, Stamp};
 pub use convert::{Outcome as ConvertOutcome, convert_all, convert_file};
 pub use decode::{
-    DecodeError, Decoded, SUPPORTED_EXTENSIONS, Stage, decode_full, decode_preview, is_supported,
+    Animation, DecodeError, Decoded, SUPPORTED_EXTENSIONS, Stage, decode_full, decode_full_static,
+    decode_preview, is_supported,
 };
 pub use edit::{Edits, Op};
 pub use export::{ExportError, Format, Settings as ExportSettings};

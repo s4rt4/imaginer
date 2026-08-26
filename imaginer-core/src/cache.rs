@@ -114,16 +114,25 @@ impl ImageCache {
     /// This is what the prefetch thread asks before deciding to decode. Renewing an
     /// entry because a background thread looked at it would let prefetching keep
     /// images alive that the user has walked away from.
-    pub fn holds(&self, path: &Path, stamp: &Stamp) -> bool {
-        self.entries
-            .get(path)
-            .is_some_and(|entry| entry.stamp == *stamp)
+    ///
+    /// `want_animation` asks for more than presence: an entry decoded by the static
+    /// path carries no frame set, and answering "yes" to a viewer about to play the
+    /// file would strand it on frame one forever. An animated entry satisfies both
+    /// kinds of request — its first frame is a perfectly good still.
+    pub fn holds(&self, path: &Path, stamp: &Stamp, want_animation: bool) -> bool {
+        self.entries.get(path).is_some_and(|entry| {
+            entry.stamp == *stamp && (!want_animation || entry.decoded.animation.is_some())
+        })
     }
 
     /// Take the decoded image for `path`, if it is held and still matches the file.
     ///
     /// Counts as use, so what the viewer actually shows is what survives eviction.
-    pub fn get(&mut self, path: &Path, stamp: &Stamp) -> Option<Decoded> {
+    /// `want_animation` is the same promise [`Self::holds`] makes: a cached still is
+    /// refused when frames were asked for. The stale entry stays put — the animated
+    /// decode this triggers will replace it through `insert`, so refusing does not
+    /// throw away pixels that are about to be superseded anyway.
+    pub fn get(&mut self, path: &Path, stamp: &Stamp, want_animation: bool) -> Option<Decoded> {
         let entry = self.entries.get(path)?;
 
         // Same path, different file. Saving over the image on screen is how this
@@ -131,6 +140,10 @@ impl ImageCache {
         // show the user something their own file no longer contains.
         if entry.stamp != *stamp {
             self.remove(path);
+            return None;
+        }
+
+        if want_animation && entry.decoded.animation.is_none() {
             return None;
         }
 
@@ -203,6 +216,7 @@ mod tests {
             stage: Stage::Full,
             orientation: Orientation::Normal,
             full_size: (side, side),
+            animation: None,
         }
     }
 
@@ -231,8 +245,8 @@ mod tests {
 
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.used(), 2 * KB);
-        assert!(!cache.holds(Path::new("a.png"), &stamp(1)));
-        assert!(cache.holds(Path::new("c.png"), &stamp(1)));
+        assert!(!cache.holds(Path::new("a.png"), &stamp(1), false));
+        assert!(cache.holds(Path::new("c.png"), &stamp(1), false));
     }
 
     #[test]
@@ -243,11 +257,11 @@ mod tests {
 
         // `a` is the oldest until it is looked at, which is the whole point of an
         // LRU: stepping back to an image is what should keep it.
-        assert!(cache.get(Path::new("a.png"), &stamp(1)).is_some());
+        assert!(cache.get(Path::new("a.png"), &stamp(1), false).is_some());
         fill(&mut cache, "c.png");
 
-        assert!(cache.holds(Path::new("a.png"), &stamp(1)));
-        assert!(!cache.holds(Path::new("b.png"), &stamp(1)));
+        assert!(cache.holds(Path::new("a.png"), &stamp(1), false));
+        assert!(!cache.holds(Path::new("b.png"), &stamp(1), false));
     }
 
     #[test]
@@ -256,10 +270,10 @@ mod tests {
         fill(&mut cache, "a.png");
         fill(&mut cache, "b.png");
 
-        assert!(cache.holds(Path::new("a.png"), &stamp(1)));
+        assert!(cache.holds(Path::new("a.png"), &stamp(1), false));
         fill(&mut cache, "c.png");
 
-        assert!(!cache.holds(Path::new("a.png"), &stamp(1)));
+        assert!(!cache.holds(Path::new("a.png"), &stamp(1), false));
     }
 
     #[test]
@@ -267,7 +281,7 @@ mod tests {
         let mut cache = ImageCache::with_budget(8 * KB);
         fill(&mut cache, "a.png");
 
-        assert!(cache.get(Path::new("a.png"), &stamp(2)).is_none());
+        assert!(cache.get(Path::new("a.png"), &stamp(2), false).is_none());
         // Not merely refused: the pixels are stale for good, so holding them would
         // be spending the budget on something that can never be served.
         assert!(cache.is_empty());
@@ -292,7 +306,7 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.used(), KB);
         // The newer stamp is the one held; the older file is gone.
-        assert!(cache.holds(Path::new("a.png"), &stamp(2)));
+        assert!(cache.holds(Path::new("a.png"), &stamp(2), false));
     }
 
     #[test]
@@ -327,5 +341,40 @@ mod tests {
     #[test]
     fn an_unreadable_path_has_no_stamp() {
         assert!(Stamp::of(Path::new("definitely-not-here.png")).is_none());
+    }
+
+    /// The same image with a two-frame animation attached.
+    fn animated(side: u32) -> Decoded {
+        let frame = Arc::new(image::RgbaImage::new(side, side));
+        let mut decoded = decoded(side);
+        decoded.animation = Some(Arc::new(crate::decode::Animation {
+            frames: vec![Arc::clone(&frame), frame],
+            delays: vec![std::time::Duration::from_millis(100); 2],
+        }));
+        decoded
+    }
+
+    #[test]
+    fn an_animated_entry_satisfies_both_kinds_of_request() {
+        let mut cache = ImageCache::with_budget(8 * KB);
+        cache.insert(PathBuf::from("a.gif"), stamp(1), animated(16));
+
+        assert!(cache.get(Path::new("a.gif"), &stamp(1), true).is_some());
+        // Its first frame is a perfectly good still.
+        assert!(cache.get(Path::new("a.gif"), &stamp(1), false).is_some());
+    }
+
+    #[test]
+    fn a_still_entry_is_refused_when_frames_were_asked_for() {
+        let mut cache = ImageCache::with_budget(8 * KB);
+        cache.insert(PathBuf::from("a.gif"), stamp(1), decoded(16));
+
+        assert!(cache.get(Path::new("a.gif"), &stamp(1), true).is_none());
+        // Refused but kept: the animated decode this triggers is about to
+        // replace the entry wholesale, so throwing it away here would only
+        // leave the budget empty in the meantime.
+        assert!(!cache.is_empty());
+        // And the still request it *does* satisfy keeps working.
+        assert!(cache.get(Path::new("a.gif"), &stamp(1), false).is_some());
     }
 }

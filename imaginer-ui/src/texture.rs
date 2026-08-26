@@ -68,3 +68,22 @@ fn upload_sized(
         downscaled: (width, height) != pixels.dimensions(),
     }
 }
+
+/// Replace what a texture shows with new pixels of the same source size.
+///
+/// The animation path uses this once per displayed frame. `TextureHandle::set`
+/// reuses the GPU texture rather than allocating a new one per frame — an
+/// animation that allocated on every advance would grow egui's texture manager
+/// for as long as it played.
+pub fn set_pixels(ctx: &egui::Context, texture: &mut ImageTexture, pixels: &RgbaImage) {
+    debug_assert_eq!(
+        pixels.dimensions(),
+        texture.source_size,
+        "animation frames are composited to one canvas size; a size change means a new image"
+    );
+
+    let max_side = ctx.input(|i| i.max_texture_side) as u32;
+    let (width, height, bytes) = imaginer_core::decode::for_upload(pixels, max_side);
+    let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &bytes);
+    texture.handle.set(image, IMAGE_TEXTURE);
+}
