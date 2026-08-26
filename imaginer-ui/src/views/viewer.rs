@@ -88,6 +88,7 @@ pub fn show(
     state: &mut ViewState,
     interactive: bool,
     colour: Colour<'_>,
+    checker: Option<&egui::TextureHandle>,
 ) -> Shown {
     let sense = if interactive {
         egui::Sense::click_and_drag()
@@ -150,6 +151,24 @@ pub fn show(
 
     let image_rect = egui::Rect::from_center_size(rect.center() + state.offset, displayed);
     let painter = ui.painter_at(rect);
+
+    // The transparency grid, under a picture with see-through pixels. One draw
+    // call: a two-by-two checker texture with wrapping UVs that run past 1.0, so
+    // the GPU tiles it and the squares stay a fixed size on screen however the
+    // picture is panned or zoomed — Photoshop's behaviour, not a pattern baked
+    // into the image that would zoom with it.
+    if texture.has_transparency
+        && let Some(checker) = checker
+    {
+        const SQUARE: f32 = 8.0;
+        let uv_max = image_rect.size() / (2.0 * SQUARE);
+        painter.image(
+            checker.id(),
+            image_rect,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, uv_max),
+            egui::Color32::WHITE,
+        );
+    }
 
     // The shader is only worth reaching for when it has something to do, and it is
     // skipped entirely if it could not be built — on hardware that cannot compile

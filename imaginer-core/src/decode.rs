@@ -143,6 +143,11 @@ pub struct Decoded {
     /// pipeline, export — keeps working unchanged on an animation; it simply acts
     /// on the frame that is showing. `None` for stills and for previews.
     pub animation: Option<Arc<Animation>>,
+    /// Whether any pixel is less than fully opaque, which is what tells the
+    /// viewer to draw a checkerboard behind the image. Computed on the decode
+    /// thread — a full alpha scan of a 24MP photograph is a memset-class pass
+    /// nobody should wait for on the UI thread.
+    pub has_transparency: bool,
 }
 
 impl Decoded {
@@ -230,6 +235,14 @@ impl std::fmt::Debug for Decoded {
     }
 }
 
+/// Whether any pixel is less than fully opaque.
+///
+/// A straight scan of the alpha bytes. Called on decode threads only; the UI
+/// gets the answer as a flag on [`Decoded`].
+fn has_transparency(pixels: &image::RgbaImage) -> bool {
+    pixels.as_raw().chunks_exact(4).any(|px| px[3] != 255)
+}
+
 /// Native dimensions of an image, read from the header without decoding pixels,
 /// and corrected for EXIF orientation.
 pub fn oriented_dimensions(path: &Path, orientation: Orientation) -> Option<(u32, u32)> {
@@ -266,12 +279,16 @@ pub fn decode_preview(path: &Path) -> Option<Decoded> {
         // stand-in — better than reporting nothing and blocking layout.
         .unwrap_or_else(|| (img.width(), img.height()));
 
+    let pixels = Arc::new(img.into_rgba8());
+    let has_transparency = has_transparency(&pixels);
+
     Some(Decoded {
-        pixels: Arc::new(img.into_rgba8()),
+        pixels,
         stage: Stage::Preview,
         orientation,
         full_size,
         animation: None,
+        has_transparency,
     })
 }
 
@@ -299,6 +316,8 @@ pub fn decode_thumb(path: &Path) -> Option<Decoded> {
     // Thumbnails are stored already oriented, so `full_size` is the only
     // layout fact still needed — and it comes from the header, not the decode.
     let full_size = oriented_dimensions(path, orientation)?;
+    // A quarter-megapixel scan, so doing it here costs nothing.
+    let has_transparency = has_transparency(&pixels);
 
     Some(Decoded {
         pixels: Arc::new(pixels),
@@ -306,6 +325,7 @@ pub fn decode_thumb(path: &Path) -> Option<Decoded> {
         orientation,
         full_size,
         animation: None,
+        has_transparency,
     })
 }
 
@@ -392,13 +412,16 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
 
     let img = orientation.apply(img);
     let full_size = (img.width(), img.height());
+    let pixels = Arc::new(img.into_rgba8());
+    let has_transparency = has_transparency(&pixels);
 
     Ok(Decoded {
-        pixels: Arc::new(img.into_rgba8()),
+        pixels,
         stage: Stage::Full,
         orientation,
         full_size,
         animation: None,
+        has_transparency,
     })
 }
 
@@ -527,6 +550,9 @@ fn decode_animation<R: BufRead + Seek>(
 
     // The first frame's size is the canvas size both codecs composite to.
     let full_size = (frames[0].width(), frames[0].height());
+    // Frame zero is what shows first and what every static path acts on; its
+    // alpha is the honest answer for the checkerboard decision.
+    let has_transparency = has_transparency(&frames[0]);
 
     if frames.len() > 1 && complete {
         let frames: Vec<_> = frames.iter().map(apply).collect();
@@ -537,6 +563,7 @@ fn decode_animation<R: BufRead + Seek>(
             orientation,
             full_size,
             animation: Some(Arc::new(Animation { frames, delays })),
+            has_transparency,
         })
     } else {
         Ok(Decoded {
@@ -545,6 +572,7 @@ fn decode_animation<R: BufRead + Seek>(
             orientation,
             full_size,
             animation: None,
+            has_transparency,
         })
     }
 }
@@ -636,6 +664,7 @@ mod tests {
             orientation: Orientation::Normal,
             full_size: (64, 16),
             animation: None,
+            has_transparency: false,
         };
 
         let (w, h, bytes) = decoded.for_upload(16384);
@@ -687,6 +716,21 @@ mod tests {
         let decoded = decode_full(&path).expect("decoding failed");
         std::fs::remove_file(&path).unwrap();
         decoded
+    }
+
+    #[test]
+    fn transparency_is_reported_only_when_a_pixel_sees_through() {
+        let path = temp_path("alpha.png");
+        let mut img = image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255]));
+        img.save(&path).unwrap();
+        assert!(!decode_full(&path).unwrap().has_transparency);
+
+        // One see-through pixel is enough to earn the checkerboard.
+        img.put_pixel(3, 3, image::Rgba([10, 20, 30, 0]));
+        img.save(&path).unwrap();
+        assert!(decode_full(&path).unwrap().has_transparency);
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

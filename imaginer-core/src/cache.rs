@@ -222,6 +222,7 @@ mod tests {
             orientation: Orientation::Normal,
             full_size: (side, side),
             animation: None,
+            has_transparency: false,
         }
     }
 

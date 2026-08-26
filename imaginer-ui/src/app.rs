@@ -199,6 +199,9 @@ pub struct App {
     /// Uploaded the first time the empty state is drawn, so launching with an image
     /// never pays for it.
     logotype: Option<egui::TextureHandle>,
+    /// The transparency checker, uploaded the first time a picture with
+    /// see-through pixels is shown. Most sessions never ask for it.
+    checker: Option<egui::TextureHandle>,
     icons: Icons,
     /// Decoded images kept around, and the thread that decodes the ones nobody has
     /// asked for yet.
@@ -281,6 +284,7 @@ impl App {
             clipboard_rx: std::sync::mpsc::channel().1,
             clipboard_busy: false,
             logotype: None,
+            checker: None,
             icons: Icons::default(),
             prefetch: Prefetcher::with_budget(cache_budget()),
             nav: NavTrace::new(),
@@ -449,6 +453,19 @@ impl App {
         self.folder = None;
 
         let full_size = pixels.dimensions();
+        // One alpha pass over clipboard pixels — a screenshot is megabytes, but
+        // this lands on the UI thread only via paste, which is a deliberate,
+        // rare action.
+        let has_transparency = {
+            let mut any = false;
+            for px in pixels.as_raw().chunks_exact(4) {
+                if px[3] != 255 {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        };
         self.accept(
             ctx,
             imaginer_core::Decoded {
@@ -459,6 +476,7 @@ impl App {
                 orientation: imaginer_core::Orientation::Normal,
                 full_size,
                 animation: None,
+                has_transparency,
             },
         );
 
@@ -1848,6 +1866,10 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 if let Some(texture) = self.texture.as_ref() {
                     let canvas = ui.max_rect();
+                    if texture.has_transparency {
+                        self.checker
+                            .get_or_insert_with(|| texture::checkerboard(&ctx));
+                    }
                     let shown = viewer::show(
                         ui,
                         texture,
@@ -1857,6 +1879,7 @@ impl eframe::App for App {
                             adjust: self.adjust,
                             shader: &self.shader,
                         },
+                        self.checker.as_ref(),
                     );
                     self.last_zoom = shown.zoom;
 
