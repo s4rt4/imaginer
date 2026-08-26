@@ -1,4 +1,4 @@
-//! Application state and the per-frame update loop.
+﻿//! Application state and the per-frame update loop.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,21 +17,18 @@ use crate::shader::AdjustShader;
 use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
 use crate::views::crop::CropState;
-use crate::views::{crop, info, sidebar, statusbar, timeline, toolbar, viewer};
+use crate::views::{crop, info, settings, sidebar, statusbar, timeline, toolbar, viewer};
 use crate::{LoadMessage, clipboard, decode_into, theme, titlebar};
 
 /// How long a status-bar notice stays up. Long enough to read in passing, short
 /// enough that it never becomes part of the furniture.
 const NOTICE_DURATION: Duration = Duration::from_secs(3);
 
-/// Time each image is held during a slideshow.
-const SLIDE_DURATION: Duration = Duration::from_secs(4);
-
 /// How far either side of the current image to decode ahead.
 ///
 /// One. Two would cover a second keypress arriving before the first prefetch
 /// finished, but it also doubles the work thrown away every time the user changes
-/// direction — and the image that matters, the very next one, would be finished no
+/// direction â€” and the image that matters, the very next one, would be finished no
 /// sooner for it.
 const PREFETCH_RADIUS: usize = 1;
 
@@ -50,7 +47,7 @@ struct Notice {
 
 /// Measurement of the action a folder session repeats most.
 ///
-/// `IMAGINER_TRACE_NAV=1` prints a line per image shown — how long it took to reach
+/// `IMAGINER_TRACE_NAV=1` prints a line per image shown â€” how long it took to reach
 /// the screen, and whether the pixels came from the cache. Prefetch is only worth a
 /// thread and 512MB if those two numbers are far apart, and this is what says whether
 /// they are. Same idiom as the startup trace: off unless asked for, and reported by
@@ -109,7 +106,7 @@ pub struct App {
     notice: Option<Notice>,
     view: viewer::ViewState,
     /// What the current file looked like on disk when it was opened. Carries the
-    /// size the status bar shows, and is what the cache is keyed on — so an image
+    /// size the status bar shows, and is what the cache is keyed on â€” so an image
     /// saved over is re-decoded rather than served from before the save.
     stamp: Option<Stamp>,
     /// True while a decode is in flight, which is also what drives repainting.
@@ -127,18 +124,24 @@ pub struct App {
     /// What to sort a listing by. Held here rather than only inside `folder`,
     /// because it has to outlive one: opening a different image throws the listing
     /// away, and the order the user picked is not a property of the folder they
-    /// happened to be in when they picked it. Lasts the session — there is nowhere
-    /// to write a setting down yet.
+    /// happened to be in when they picked it. Starts from the saved settings, and
+    /// a change here is written back â€” see `set_order`.
     order: Order,
+    /// What the settings panel can change, loaded once at startup and saved on
+    /// change. The slideshow's hold time and the default sort order live here.
+    settings: imaginer_core::Settings,
+    /// Whether the settings panel is open. Shares the right-hand strip with the
+    /// edit sidebar and the info panel â€” one at a time.
+    settings_open: bool,
     /// The pixels exactly as decoded, kept so every edit runs from the original
     /// rather than compounding on already-edited output. Behind an `Arc` because it
-    /// is shared: with the edit worker, and with the cache entry it came from — so
+    /// is shared: with the edit worker, and with the cache entry it came from â€” so
     /// an image evicted while it is still on screen costs nothing to keep showing.
     source: Option<Arc<RgbaImage>>,
     edits: Edits,
     /// What the colour sliders are showing, which is not always what the undo stack
     /// holds: mid-drag it runs ahead, and it is committed when the slider is let go.
-    /// The texture never contains it — the shader applies it at draw time.
+    /// The texture never contains it â€” the shader applies it at draw time.
     adjust: Adjust,
     /// Draws the adjustment. Compiled on first use, not at startup.
     shader: AdjustShader,
@@ -159,7 +162,7 @@ pub struct App {
     /// Whether frames advance on their own. An animation arrives playing; pause
     /// is what the user does to it.
     anim_playing: bool,
-    /// When the frame on screen gives way to the next. `None` while paused —
+    /// When the frame on screen gives way to the next. `None` while paused â€”
     /// same shape as `slideshow`, and ticked the same way, so idle CPU stays at
     /// zero between frames of a paused or absent animation.
     anim_due: Option<Instant>,
@@ -177,7 +180,7 @@ pub struct App {
     sidebar_open: bool,
     info_open: bool,
     /// What the EXIF block of the image on screen holds. Read when the info panel
-    /// first asks for it and kept until the image changes — `info_read` is what
+    /// first asks for it and kept until the image changes â€” `info_read` is what
     /// tells "not looked at yet" apart from "looked, and there was none".
     info: imaginer_core::Info,
     info_read: bool,
@@ -220,9 +223,15 @@ impl App {
         trace.mark("theme_ready");
 
         // The image handed to us on the command line never passes through `show`,
-        // so its export format has to be picked up here too — otherwise launching
+        // so its export format has to be picked up here too â€” otherwise launching
         // straight onto a JPEG offers to save it as a PNG.
         let export = export_defaults(path.as_deref());
+
+        // Read before anything that consults it: the saved sort order is what
+        // this session starts with. A file read of a few bytes, and it sits
+        // after the decode spawn on the startup path â€” the decode thread is
+        // already running by the time this line executes.
+        let settings = imaginer_core::Settings::load();
 
         Self {
             trace,
@@ -239,7 +248,9 @@ impl App {
             last_zoom: 1.0,
             fullscreen: false,
             folder: None,
-            order: Order::DEFAULT,
+            order: settings.order,
+            settings,
+            settings_open: false,
             source: None,
             edits: Edits::default(),
             adjust: Adjust::NONE,
@@ -282,7 +293,7 @@ impl App {
         self.show(ctx, path);
 
         // Rescanned straight away rather than left for the first arrow key. The scan
-        // is kept off the *startup* path, which this is not — and prefetch cannot
+        // is kept off the *startup* path, which this is not â€” and prefetch cannot
         // warm neighbours nobody has told it about, so deferring it would mean the
         // first step after every Open was the slow kind.
         self.folder();
@@ -302,14 +313,20 @@ impl App {
 
     /// Re-order the folder listing.
     ///
-    /// The image on screen does not change — `Folder::set_order` keeps the cursor on
-    /// it — but what comes next does, so the warmed neighbours are now the previous
+    /// The image on screen does not change â€” `Folder::set_order` keeps the cursor on
+    /// it â€” but what comes next does, so the warmed neighbours are now the previous
     /// order's and have to be asked for again.
+    ///
+    /// The choice is also written to the settings file: it is what new sessions
+    /// start from, which is the whole reason the settings exist. A few bytes per
+    /// click, on a click nobody is waiting behind.
     fn set_order(&mut self, order: Order) {
         self.order = order;
         if let Some(folder) = self.folder.as_mut() {
             folder.set_order(order);
         }
+        self.settings.order = order;
+        self.settings.save();
         self.warm_neighbours();
     }
 
@@ -329,8 +346,8 @@ impl App {
 
     /// Clear out everything that belonged to the image being replaced.
     ///
-    /// Shared by every route that puts a new image on screen — opened, stepped to,
-    /// or pasted — because forgetting one of these is exactly how an edit stack or a
+    /// Shared by every route that puts a new image on screen â€” opened, stepped to,
+    /// or pasted â€” because forgetting one of these is exactly how an edit stack or a
     /// stale decode leaks from one image into the next. `path` is `None` for pixels
     /// that came from the clipboard and have no file behind them.
     fn begin_showing(&mut self, path: Option<PathBuf>) {
@@ -348,7 +365,7 @@ impl App {
         self.texture_generation += 1;
 
         // The outgoing image stays up until its replacement is ready. Clearing it
-        // here instead would flash the empty state — logo, "drop an image here" —
+        // here instead would flash the empty state â€” logo, "drop an image here" â€”
         // between every pair of photographs, which is the same reason there is no
         // spinner: a window that empties and refills reads as jankier than one that
         // waits the extra 50ms. The view is refitted when the new pixels land, not
@@ -387,7 +404,7 @@ impl App {
     fn show(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.begin_showing(Some(path.clone()));
 
-        // Prefetched or stepped back to, this image may already be decoded — in
+        // Prefetched or stepped back to, this image may already be decoded â€” in
         // which case it goes up in this very frame. No thread, no second frame, and
         // none of the wait that makes walking a folder feel slow. Asking with the
         // frame set in mind: a still that prefetch stored for an animated file is
@@ -451,7 +468,7 @@ impl App {
     /// Ask the prefetch thread to decode the images either side of this one.
     ///
     /// Silently does nothing while the folder listing is still unbuilt, which is only
-    /// ever the first frame — the scan is deliberately off the startup path, and
+    /// ever the first frame â€” the scan is deliberately off the startup path, and
     /// forcing it here to warm a neighbour would put it back on.
     fn warm_neighbours(&self) {
         let Some(folder) = self.folder.as_ref() else {
@@ -464,7 +481,7 @@ impl App {
     /// asked for.
     ///
     /// Called once per decode message, which for an animated file is twice at full
-    /// resolution: first the still — frame one — so something correct is up fast,
+    /// resolution: first the still â€” frame one â€” so something correct is up fast,
     /// then the whole frame set, which swaps in without touching layout because it
     /// has the very same canvas size.
     fn accept(&mut self, ctx: &egui::Context, decoded: Decoded) {
@@ -486,7 +503,7 @@ impl App {
         // preview at the wrong resolution and an export at the wrong one entirely.
         if stage == Stage::Full {
             // The nav trace reports one line per image shown, and the frame set
-            // that follows a still belongs to that same arrival — `source` being
+            // that follows a still belongs to that same arrival â€” `source` being
             // set already says this image made it to the screen once.
             if self.source.is_none() {
                 self.nav.arrived(self.path.as_deref());
@@ -503,8 +520,8 @@ impl App {
         }
 
         // An animated decode starts playing the moment it lands; anything else
-        // leaves playback parked. Frame zero is what was just uploaded — `pixels`
-        // *is* frame zero — so arming the deadline is all starting takes.
+        // leaves playback parked. Frame zero is what was just uploaded â€” `pixels`
+        // *is* frame zero â€” so arming the deadline is all starting takes.
         self.animation = animation;
         self.anim_frame = 0;
         if let Some(anim) = self.animation.as_ref() {
@@ -532,7 +549,7 @@ impl App {
                     }
                 }
                 Err(TryRecvError::Empty) => break,
-                // Sender gone with nothing more to say — the decode finished.
+                // Sender gone with nothing more to say â€” the decode finished.
                 // `loading` means "a decode channel is still alive", so it ends
                 // here and only here: an animated file sends a second message
                 // after its first full decode, and treating either message as the
@@ -661,7 +678,7 @@ impl App {
     /// Record what the sliders now show, so it can be undone.
     ///
     /// Called when a slider is let go rather than as it moves. Nothing happens if the
-    /// value is already the one on the stack — clicking a slider without moving it
+    /// value is already the one on the stack â€” clicking a slider without moving it
     /// should not add a step to undo through.
     fn commit_adjust(&mut self, ctx: &egui::Context) {
         if self.adjust == self.edits.adjust() {
@@ -687,7 +704,7 @@ impl App {
         };
 
         // Geometry edits bake into the texture, which playback would overwrite
-        // with unedited frames on its next advance — so an op pauses the film.
+        // with unedited frames on its next advance â€” so an op pauses the film.
         // (Colour is different: the shader applies it at draw time, so sliders
         // keep working live over a playing animation.)
         self.pause_animation();
@@ -777,8 +794,8 @@ impl App {
     /// Everything is read through `consume_key`, which matches against the modifiers
     /// recorded on the key event itself rather than the ones still held when the
     /// frame is assembled. Those differ more often than it sounds: a quick Ctrl+S can
-    /// be pressed and fully released inside one frame, and `input.modifiers` — a
-    /// snapshot of the end of that frame — then reports nothing held at all, so the
+    /// be pressed and fully released inside one frame, and `input.modifiers` â€” a
+    /// snapshot of the end of that frame â€” then reports nothing held at all, so the
     /// shortcut silently does nothing. Consuming also means a widget later in the
     /// frame cannot act on the same press a second time.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -806,7 +823,7 @@ impl App {
         // The clipboard shortcuts cannot be read the way everything above is, and
         // that is a property of the framework rather than a choice. egui-winit
         // intercepts them before any key event exists: Ctrl+C becomes `Event::Copy`
-        // and returns, Ctrl+V becomes `Event::Paste` — but only when the clipboard
+        // and returns, Ctrl+V becomes `Event::Paste` â€” but only when the clipboard
         // holds *text*, so an image on it produces no event at all. Its test is
         // `command && key == C`, with shift neither required nor excluded, which is
         // also why the `Ctrl+Shift+C` this app used to bind for copy-path could
@@ -814,7 +831,7 @@ impl App {
         //
         // So Ctrl+C arrives as `Event::Copy` and copies the image, which is what
         // Ctrl+C means in a viewer. Paste answers to `Event::Paste` when egui sends
-        // one, and to a plain `V` always — the only spelling that survives, since
+        // one, and to a plain `V` always â€” the only spelling that survives, since
         // every Ctrl+V variant is swallowed whether or not anything comes back.
         // Copy-path moves to plain `P` for the same reason, beside its toolbar
         // button, which was doing all the work already.
@@ -828,7 +845,7 @@ impl App {
         // A focused widget owns the plain keys, so everything below this point waits.
         // The colour sliders are the first things in this app to take keyboard focus,
         // and without this an arrow key meant to nudge brightness would step to the
-        // next image instead — this handler runs before any widget is drawn, so it
+        // next image instead â€” this handler runs before any widget is drawn, so it
         // would win every time. Escape belongs to the widget too: egui uses it to
         // leave one, and closing the window out from under somebody tabbing through
         // sliders is not what they asked for.
@@ -860,14 +877,23 @@ impl App {
                     i.consume_key(NONE, Key::C),
                 )
             });
-        let (enter, info) =
-            ctx.input_mut(|i| (i.consume_key(NONE, Key::Enter), i.consume_key(NONE, Key::I)));
+        let (enter, info, settings_key) = ctx.input_mut(|i| {
+            (
+                i.consume_key(NONE, Key::Enter),
+                i.consume_key(NONE, Key::I),
+                i.consume_key(NONE, Key::S),
+            )
+        });
 
         if escape {
             // Escape means "back out of where I am", and cropping is the innermost
             // place to be.
             if self.crop.is_some() {
                 self.crop = None;
+                return;
+            }
+            if self.settings_open {
+                self.settings_open = false;
                 return;
             }
             if self.fullscreen {
@@ -924,7 +950,7 @@ impl App {
             self.delete_current(ctx);
         }
         if rotate {
-            // The same op the sidebar's rotate button pushes — there is exactly one
+            // The same op the sidebar's rotate button pushes â€” there is exactly one
             // rotation in this app, and it is an edit.
             self.push_op(ctx, Op::RotateCw);
         }
@@ -934,9 +960,12 @@ impl App {
         if info {
             self.toggle_info();
         }
+        if settings_key {
+            self.toggle_settings();
+        }
         // Space means "stop/start the thing that is moving": an animation's
         // playback when there is one, otherwise the slideshow. The two never run
-        // as one — stepping to a still mid-slideshow keeps the slideshow, and an
+        // as one â€” stepping to a still mid-slideshow keeps the slideshow, and an
         // animated file plays whether or not it has neighbours.
         if slideshow {
             if self.animation.is_some() {
@@ -978,6 +1007,32 @@ impl App {
         });
     }
 
+    /// Apply what the settings panel asked for.
+    ///
+    /// The slider updates live as it drags; only its release touches the disk,
+    /// so a drag from 4 to 30 is one write rather than twenty-six. A sort pick
+    /// is a single deliberate click and writes at once.
+    fn apply_settings(&mut self, ctx: &egui::Context, action: settings::Action) {
+        match action {
+            settings::Action::Close => self.settings_open = false,
+            settings::Action::SetSlideshow(secs) => self.settings.slideshow_secs = secs,
+            settings::Action::CommitSlideshow => {
+                self.settings.save();
+                self.notify(format!(
+                    "Slideshow set to {} seconds per image",
+                    self.settings.slideshow_secs
+                ));
+            }
+            settings::Action::SetOrder(order) => {
+                // `set_order` re-sorts the listing, re-warms the prefetch and
+                // writes the settings file â€” everything a sort pick means.
+                self.set_order(order);
+            }
+        }
+        let _ = ctx;
+    }
+
+    /// Apply what the toolbar asked for.
     fn apply(&mut self, ctx: &egui::Context, action: toolbar::Action) {
         match action {
             toolbar::Action::Open => self.prompt_for_file(ctx),
@@ -989,6 +1044,7 @@ impl App {
             toolbar::Action::ToggleFullscreen => self.set_fullscreen(ctx, !self.fullscreen),
             toolbar::Action::ToggleSlideshow => self.toggle_slideshow(),
             toolbar::Action::ToggleSidebar => self.toggle_sidebar(),
+            toolbar::Action::ToggleSettings => self.toggle_settings(),
         }
     }
 
@@ -1013,7 +1069,7 @@ impl App {
             sidebar::Action::CancelCrop => self.crop = None,
             // Nothing to do: the slider has already written its new value into
             // `self.adjust`, and the shader reads that when the frame is drawn.
-            // Which is the whole point — a slider that costs a repaint and nothing
+            // Which is the whole point â€” a slider that costs a repaint and nothing
             // else is one that can be dragged.
             sidebar::Action::Adjusting => {}
             sidebar::Action::CommitAdjust => self.commit_adjust(ctx),
@@ -1027,11 +1083,12 @@ impl App {
     /// Open the edit sidebar, and put the info panel away.
     ///
     /// The two are the same strip of window. Both at once would leave the
-    /// photograph a column down the middle, so opening either closes the other —
+    /// photograph a column down the middle, so opening either closes the other â€”
     /// and there is no arrangement of the pair worth the width it would cost.
     fn open_sidebar(&mut self) {
         self.sidebar_open = true;
         self.info_open = false;
+        self.settings_open = false;
     }
 
     fn toggle_sidebar(&mut self) {
@@ -1045,6 +1102,16 @@ impl App {
         self.info_open = !self.info_open;
         if self.info_open {
             self.sidebar_open = false;
+            self.settings_open = false;
+        }
+    }
+
+    /// Same strip, same rule as the other two panels.
+    fn toggle_settings(&mut self) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.sidebar_open = false;
+            self.info_open = false;
         }
     }
 
@@ -1052,7 +1119,7 @@ impl App {
     ///
     /// Called from the frame that draws the panel rather than from the load, so a
     /// session that never opens it never pays. The read itself is a file open and a
-    /// few kilobytes — noise beside the decode it sits next to, and nothing like
+    /// few kilobytes â€” noise beside the decode it sits next to, and nothing like
     /// enough work to be worth a thread and a channel to report back on.
     fn read_info(&mut self) {
         if self.info_read {
@@ -1095,7 +1162,7 @@ impl App {
     /// Measure the transparent border, off the UI thread.
     ///
     /// The answer depends on the pixels rather than on the size, so it cannot be an
-    /// op of its own — the export panel has to be able to predict output dimensions
+    /// op of its own â€” the export panel has to be able to predict output dimensions
     /// without running the pipeline. What comes back becomes an ordinary crop, which
     /// keeps the stack honest about what happened and undoes like anything else.
     fn request_trim(&mut self, ctx: &egui::Context) {
@@ -1167,7 +1234,7 @@ impl App {
 
     /// Write the edited pixels out.
     ///
-    /// Save-as whenever the result would not simply take the original's place — a
+    /// Save-as whenever the result would not simply take the original's place â€” a
     /// different format or a different size is a new file, and quietly replacing
     /// the original with it is how originals get lost.
     fn save(&mut self, ctx: &egui::Context) {
@@ -1234,7 +1301,7 @@ impl App {
 
         // Converting produces a name that cannot collide with the original, so it
         // keeps the original's. Anything else would land on top of it, so it does
-        // not — the shell will still ask before overwriting, but a suggestion that
+        // not â€” the shell will still ask before overwriting, but a suggestion that
         // aims at your own source file is a poor one.
         let suggested = if converting {
             format!("{stem}.{}", format.extension())
@@ -1313,7 +1380,7 @@ impl App {
     /// Pick a folder and show the first image in it.
     ///
     /// The listing is built here rather than lazily, because it is the whole point
-    /// of the action — the user asked for the folder, not for one file in it.
+    /// of the action â€” the user asked for the folder, not for one file in it.
     fn prompt_for_folder(&mut self, ctx: &egui::Context) {
         let mut dialog = rfd::FileDialog::new();
         if let Some(dir) = self.path.as_deref().and_then(|p| p.parent()) {
@@ -1351,7 +1418,7 @@ impl App {
     /// Put the image as it now looks on the clipboard.
     ///
     /// The edited pixels, not the file on disk. What Ctrl+C means in a viewer is
-    /// "the thing I am looking at" — rotating an image and then pasting the
+    /// "the thing I am looking at" â€” rotating an image and then pasting the
     /// unrotated original elsewhere is the wrong kind of surprise.
     fn copy_image(&mut self, ctx: &egui::Context) {
         let Some(source) = self.source.clone() else {
@@ -1453,7 +1520,7 @@ impl App {
         }
 
         // Hand the budget back. The stamp check would refuse to serve these pixels
-        // anyway, but only once somebody asked — and nobody will, because the file
+        // anyway, but only once somebody asked â€” and nobody will, because the file
         // is gone. Left alone they would sit there evicting images that still exist.
         self.prefetch.forget(&path);
 
@@ -1490,16 +1557,17 @@ impl App {
     /// Whether there is more than one image to move between.
     ///
     /// `false` while the listing is still unbuilt, which is only ever the first
-    /// frame — chrome that offers to step somewhere there is nowhere to step is
+    /// frame â€” chrome that offers to step somewhere there is nowhere to step is
     /// worse than chrome that appears a frame late.
     fn has_neighbours(&self) -> bool {
         self.folder.as_ref().is_some_and(|folder| folder.len() > 1)
     }
 
     fn toggle_slideshow(&mut self) {
+        let duration = Duration::from_secs(u64::from(self.settings.slideshow_secs));
         self.slideshow = match self.slideshow {
             Some(_) => None,
-            None => Some(Instant::now() + SLIDE_DURATION),
+            None => Some(Instant::now() + duration),
         };
     }
 
@@ -1515,7 +1583,7 @@ impl App {
             return;
         }
 
-        self.slideshow = Some(now + SLIDE_DURATION);
+        self.slideshow = Some(now + Duration::from_secs(u64::from(self.settings.slideshow_secs)));
         self.step(ctx, true);
     }
 
@@ -1523,7 +1591,7 @@ impl App {
     ///
     /// Keys and the scroll wheel, not pointer movement: a slideshow that stopped
     /// because the mouse was nudged would be unusable. Space is the exception,
-    /// because it is the key that toggles the thing — letting it count as an
+    /// because it is the key that toggles the thing â€” letting it count as an
     /// interruption would stop the slideshow here and immediately restart it in the
     /// shortcut handler a few lines later.
     fn interrupt_slideshow(&mut self, ctx: &egui::Context) {
@@ -1539,7 +1607,7 @@ impl App {
                         egui::Event::Key { key, pressed: true, .. } if *key != egui::Key::Space
                     // Ctrl+C and Ctrl+V never arrive as key presses, so without
                     // these two a slideshow would carry on running underneath a
-                    // copy — and the next slide would land before the worker had
+                    // copy â€” and the next slide would land before the worker had
                     // read the image the user meant.
                     ) || matches!(event, egui::Event::Copy | egui::Event::Paste(_))
                 })
@@ -1659,6 +1727,7 @@ impl eframe::App for App {
                             has_neighbours,
                             sidebar_open: self.sidebar_open,
                             info_open: self.info_open,
+                            settings_open: self.settings_open,
                             order: self.order,
                         },
                     );
@@ -1685,8 +1754,8 @@ impl eframe::App for App {
         }
 
         // Only over an image: with nothing on screen every row would be blank, and
-        // the panel would describe a file that is not open. Emptying the window —
-        // deleting the last image in a folder — therefore puts it away by itself,
+        // the panel would describe a file that is not open. Emptying the window â€”
+        // deleting the last image in a folder â€” therefore puts it away by itself,
         // and opening another brings it back.
         let mut info_action = None;
         if self.info_open && self.texture.is_some() {
@@ -1746,6 +1815,27 @@ impl eframe::App for App {
                                 aspect: crop.aspect,
                                 selection: crop.rectangle().map(|(_, _, w, h)| (w, h)),
                             }),
+                        },
+                    );
+                });
+        }
+
+        // Unlike the info panel and the sidebar, the settings panel is useful with
+        // nothing open â€” the shortcuts are a reference, the preferences are about
+        // the app â€” so it does not wait for an image.
+        let mut settings_action = None;
+        if self.settings_open {
+            egui::Panel::right(egui::Id::new("settings"))
+                .exact_size(settings::WIDTH)
+                .resizable(false)
+                .frame(egui::Frame::NONE.fill(theme::PANEL_BG))
+                .show(ui, |ui| {
+                    settings_action = settings::show(
+                        ui,
+                        &mut self.icons,
+                        &mut settings::State {
+                            slideshow_secs: &mut self.settings.slideshow_secs,
+                            order: self.order,
                         },
                     );
                 });
@@ -1817,6 +1907,9 @@ impl eframe::App for App {
         if let Some(action) = sidebar_action {
             self.apply_sidebar(&ctx, action);
         }
+        if let Some(action) = settings_action {
+            self.apply_settings(&ctx, action);
+        }
         if info_action == Some(info::Action::Close) {
             self.info_open = false;
         }
@@ -1854,7 +1947,7 @@ impl eframe::App for App {
     }
 }
 
-/// Drawn width of the wordmark. Present but quiet — this screen exists to be left,
+/// Drawn width of the wordmark. Present but quiet â€” this screen exists to be left,
 /// so the logo should identify the app without turning into a splash screen.
 const LOGOTYPE_DRAW_WIDTH: f32 = 210.0;
 
@@ -1908,7 +2001,7 @@ fn cache_budget() -> usize {
 ///
 /// The format defaults to the one the file is already in, so Save means save rather
 /// than convert. A format this build can read but not write falls back to PNG, the
-/// lossless option — converting is then the honest description of what will happen.
+/// lossless option â€” converting is then the honest description of what will happen.
 fn export_defaults(path: Option<&Path>) -> imaginer_core::ExportSettings {
     imaginer_core::ExportSettings {
         format: path

@@ -24,6 +24,7 @@ pub enum Action {
     ToggleFullscreen,
     ToggleSlideshow,
     ToggleSidebar,
+    ToggleSettings,
 }
 
 /// What the toolbar needs to know about the rest of the app to draw itself.
@@ -37,6 +38,7 @@ pub struct Bar {
     pub has_neighbours: bool,
     pub sidebar_open: bool,
     pub info_open: bool,
+    pub settings_open: bool,
     /// What the folder listing is currently ordered by.
     pub order: Order,
 }
@@ -149,6 +151,16 @@ pub fn show(
         // Alone at the far end, because it opens a whole second surface rather than
         // doing one thing to the image — the other buttons are all instant.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Beside the edit toggle rather than with the file actions: it opens
+            // a panel, like the edit sidebar does, and works with no image open.
+            let tooltip = if bar.settings_open {
+                "Close settings (S)"
+            } else {
+                "Settings and shortcuts (S)"
+            };
+            if icons::button(ui, icons, Icon::Setting, tooltip).clicked() {
+                action = Some(Action::ToggleSettings);
+            }
             ui.add_enabled_ui(bar.has_image, |ui| {
                 let tooltip = if bar.sidebar_open {
                     "Close the edit sidebar (E)"

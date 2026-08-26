@@ -1,5 +1,6 @@
 pub mod crop;
 pub mod info;
+pub mod settings;
 pub mod sidebar;
 pub mod statusbar;
 pub mod timeline;
