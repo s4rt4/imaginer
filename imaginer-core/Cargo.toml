@@ -24,6 +24,11 @@ image = { version = "0.25.10", default-features = false, features = [
     # nothing to carry, being a header and raw samples.
     "tiff",
     "ff",
+    # AVIF was evaluated for Phase 4 and rejected: decode needs the `avif-native`
+    # feature, which builds dav1d from C and wants pkg-config plus a system
+    # library (or nasm and meson). Measured here 2026-08-26 — the build fails
+    # without C toolchain setup no personal machine should need for a viewer.
+    # The extension stays off SUPPORTED_EXTENSIONS: the list is a promise.
 ] }
 kamadak-exif = "0.6.1"
 thiserror = "2.0.19"
@@ -39,3 +44,9 @@ resvg = "0.47"
 # and `image-webp` is lossless-only, and lossless defeats the point: the reason to
 # write WebP here is a smaller file for the web.
 webp = "0.3.1"
+
+# PSD is parsed by hand in `psd.rs` — the flattened composite Photoshop writes
+# for compatibility is a header, three skip-lengths and planar samples (raw or
+# PackBits), and the one crate that reads it had an uncompressed-path bug that
+# silently dropped the last channel. Layers and blend modes are a compositor's
+# job and deliberately not attempted.

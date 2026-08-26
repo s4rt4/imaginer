@@ -54,8 +54,9 @@ if (-not $Exe) {
 # thing people want, and the app writes .ico either way.
 # .svg is the one worth having here above all: right-click a logo and get an .ico
 # or a WebP, which is the errand that sends people to an online converter.
+# .psd converts the flattened composite, which is what the app decodes.
 $extensions = @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp',
-                '.tif', '.tiff', '.ico', '.ff', '.svg', '.svgz')
+                '.tif', '.tiff', '.ico', '.ff', '.svg', '.svgz', '.psd')
 
 # What the submenu offers. The quality is fixed because a context menu has no room
 # for a slider: 90 is the CLI default and the point past which WebP and JPEG grow

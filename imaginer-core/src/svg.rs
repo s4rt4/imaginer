@@ -90,6 +90,17 @@ impl Svg {
         self.rasterise(target / longest)
     }
 
+    /// Rasterise so the longest side is exactly `target` pixels.
+    ///
+    /// The zoom-in path calls this: the first render is a guess at a viewing
+    /// size, and when the user magnifies past it the viewer asks for exactly as
+    /// many pixels as the screen will show, clamping to [`MAX_SIDE`] itself.
+    pub fn render_longest(&self, target: u32) -> Result<RgbaImage, SvgError> {
+        let (width, height) = self.size();
+        let longest = width.max(height).max(1.0);
+        self.rasterise(target as f32 / longest)
+    }
+
     /// Rasterise to an exact pixel width, with the height following the aspect ratio.
     ///
     /// What the build script wants: an icon has to come out exactly the size the

@@ -2,7 +2,7 @@
 //!
 //! The whole point of Imaginer is that something correct appears on screen fast.
 //! So decoding is split: [`decode_preview`] pulls the thumbnail that cameras and
-//! phones already embed in the EXIF block (a few hundred microseconds — no full
+//! phones already embed in the EXIF block (a few hundred microseconds â€” no full
 //! decode at all), and [`decode_full`] does the real work afterwards. The viewer
 //! shows whichever arrives first and swaps in the full image when it lands.
 
@@ -19,7 +19,7 @@ use crate::metadata::{self, Orientation};
 
 /// File extensions this build can decode, lower-case and without the dot.
 ///
-/// Mirrors the `image` feature list in `Cargo.toml` — a new format has to be added
+/// Mirrors the `image` feature list in `Cargo.toml` â€” a new format has to be added
 /// in both places. Everything that needs to ask "is this an image?" reads it from
 /// here: the open dialog's filter, the folder listing, and the shell integration's
 /// idea of which files to offer a Convert menu on.
@@ -29,7 +29,7 @@ use crate::metadata::{self, Orientation};
 /// decoders than encoders, and offering a save format that then fails is worse than
 /// not offering it.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "ff", "svg", "svgz",
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "ff", "svg", "svgz", "psd",
 ];
 
 /// Whether `path` looks like something this build can open.
@@ -80,9 +80,9 @@ pub enum Stage {
 /// The frames of an animated GIF or WebP, each already composited to the full
 /// canvas size.
 ///
-/// Both codecs hand back whole pictures — `image`'s GIF path applies disposal
+/// Both codecs hand back whole pictures â€” `image`'s GIF path applies disposal
 /// methods and blends sub-rectangles onto the canvas itself, and image-webp does
-/// its own blending inside `read_frame` — so a frame here is exactly what belongs
+/// its own blending inside `read_frame` â€” so a frame here is exactly what belongs
 /// on screen, with no further compositing anywhere else. That is what makes random
 /// access cheap enough for a timeline scrub: any frame can go straight to the GPU.
 pub struct Animation {
@@ -104,7 +104,7 @@ impl Animation {
 
     /// Memory the whole frame set occupies, which is what the cache budgets
     /// against. An animation's cost is all of its frames, not just the one on
-    /// screen — undercounting would let one long GIF quietly hold more than the
+    /// screen â€” undercounting would let one long GIF quietly hold more than the
     /// budget says.
     pub fn byte_size(&self) -> usize {
         self.frames.iter().map(|f| f.as_raw().len()).sum()
@@ -127,8 +127,8 @@ impl std::fmt::Debug for Animation {
 /// twice without decoding it twice.
 #[derive(Clone)]
 pub struct Decoded {
-    /// Behind an `Arc` because one decode is wanted in three places at once — the
-    /// texture upload, the edit pipeline's untouched original, and the cache — and a
+    /// Behind an `Arc` because one decode is wanted in three places at once â€” the
+    /// texture upload, the edit pipeline's untouched original, and the cache â€” and a
     /// 24MP photograph is 100MB of pixels. Copying that around to share it would
     /// undo the point of keeping it.
     pub pixels: Arc<image::RgbaImage>,
@@ -136,11 +136,11 @@ pub struct Decoded {
     pub orientation: Orientation,
     /// Native size of the source image, oriented. Known even for a preview, so the
     /// viewer can lay out and set the zoom level correctly before the full decode
-    /// arrives — no layout jump when it swaps in.
+    /// arrives â€” no layout jump when it swaps in.
     pub full_size: (u32, u32),
     /// The remaining frames when the file turned out to be animated. `pixels` is
-    /// always its first frame, so every static code path — viewer layout, edit
-    /// pipeline, export — keeps working unchanged on an animation; it simply acts
+    /// always its first frame, so every static code path â€” viewer layout, edit
+    /// pipeline, export â€” keeps working unchanged on an animation; it simply acts
     /// on the frame that is showing. `None` for stills and for previews.
     pub animation: Option<Arc<Animation>>,
     /// Whether any pixel is less than fully opaque, which is what tells the
@@ -148,6 +148,11 @@ pub struct Decoded {
     /// thread — a full alpha scan of a 24MP photograph is a memset-class pass
     /// nobody should wait for on the UI thread.
     pub has_transparency: bool,
+    /// The parsed vector artwork, when the file is an SVG. `pixels` here are one
+    /// rasterisation of it; the viewer re-renders at higher resolution when the
+    /// user zooms past what this raster resolves, which is the whole point of
+    /// vector formats. `None` for everything else.
+    pub svg: Option<Arc<crate::svg::Svg>>,
 }
 
 impl Decoded {
@@ -164,7 +169,7 @@ impl Decoded {
     /// How much memory the pixels occupy, which is what the cache budgets against.
     ///
     /// The buffer itself, not `size_of` the struct: everything else here is a
-    /// handful of bytes beside it. For an animation that means every frame —
+    /// handful of bytes beside it. For an animation that means every frame â€”
     /// `pixels` alone would undercount by all but one.
     pub fn byte_size(&self) -> usize {
         match &self.animation {
@@ -178,7 +183,7 @@ impl Decoded {
     ///
     /// Limits are commonly 16384 texels per side; panoramas and large scans exceed
     /// that, and an oversized upload fails outright rather than degrading, so it
-    /// has to be handled. Borrows in the common case — the copy only happens when
+    /// has to be handled. Borrows in the common case â€” the copy only happens when
     /// scaling is actually required.
     pub fn for_upload(&self, max_side: u32) -> (u32, u32, Cow<'_, [u8]>) {
         for_upload(&self.pixels, max_side)
@@ -190,7 +195,7 @@ impl Decoded {
 ///
 /// Limits are commonly 16384 texels per side; panoramas and large scans exceed that,
 /// and an oversized upload fails outright rather than degrading, so it has to be
-/// handled. Borrows in the common case — the copy only happens when scaling is
+/// handled. Borrows in the common case â€” the copy only happens when scaling is
 /// actually required.
 ///
 /// Free-standing rather than a method, because edited pixels need exactly the same
@@ -218,7 +223,7 @@ fn fit_scale(width: u32, height: u32, max_side: u32) -> Option<f64> {
     (longest > max_side).then(|| max_side as f64 / longest as f64)
 }
 
-// Hand-written so debug output stays a single line — the derive would dump every
+// Hand-written so debug output stays a single line â€” the derive would dump every
 // pixel in the buffer.
 impl std::fmt::Debug for Decoded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -256,7 +261,7 @@ pub fn oriented_dimensions(path: &Path, orientation: Orientation) -> Option<(u32
 
 /// Try to produce an instant preview from the JPEG thumbnail embedded in EXIF.
 ///
-/// Returns `None` whenever that isn't possible — no EXIF, no thumbnail, or a
+/// Returns `None` whenever that isn't possible â€” no EXIF, no thumbnail, or a
 /// corrupt one. That is an entirely normal outcome (screenshots and PNGs have no
 /// thumbnail), so the caller should just wait for the full decode.
 pub fn decode_preview(path: &Path) -> Option<Decoded> {
@@ -276,7 +281,7 @@ pub fn decode_preview(path: &Path) -> Option<Decoded> {
     let img = orientation.apply(img);
     let full_size = oriented_dimensions(path, orientation)
         // If the header read fails, the thumbnail's own size is a poor but usable
-        // stand-in — better than reporting nothing and blocking layout.
+        // stand-in â€” better than reporting nothing and blocking layout.
         .unwrap_or_else(|| (img.width(), img.height()));
 
     let pixels = Arc::new(img.into_rgba8());
@@ -288,7 +293,7 @@ pub fn decode_preview(path: &Path) -> Option<Decoded> {
         orientation,
         full_size,
         animation: None,
-        has_transparency,
+        has_transparency,        svg: None,
     })
 }
 
@@ -301,7 +306,7 @@ fn thumbnail_field(exif: &exif::Exif, tag: exif::Tag) -> Option<usize> {
 
 /// Try the on-disk thumbnail cache, the fallback behind [`decode_preview`].
 ///
-/// Files without an EXIF thumbnail — screenshots, PNGs, anything downloaded —
+/// Files without an EXIF thumbnail â€” screenshots, PNGs, anything downloaded â€”
 /// used to have no fast first paint at all: every open paid the full decode
 /// before anything appeared. Once this app has decoded a file once, its
 /// quarter-megapixel stand-in lives on disk keyed by path, size and mtime, and
@@ -314,7 +319,7 @@ pub fn decode_thumb(path: &Path) -> Option<Decoded> {
     let mut reader = BufReader::new(File::open(path).ok()?);
     let orientation = metadata::read_orientation(&mut reader);
     // Thumbnails are stored already oriented, so `full_size` is the only
-    // layout fact still needed — and it comes from the header, not the decode.
+    // layout fact still needed â€” and it comes from the header, not the decode.
     let full_size = oriented_dimensions(path, orientation)?;
     // A quarter-megapixel scan, so doing it here costs nothing.
     let has_transparency = has_transparency(&pixels);
@@ -325,7 +330,7 @@ pub fn decode_thumb(path: &Path) -> Option<Decoded> {
         orientation,
         full_size,
         animation: None,
-        has_transparency,
+        has_transparency,        svg: None,
     })
 }
 
@@ -341,7 +346,7 @@ pub fn decode_full(path: &Path) -> Result<Decoded, DecodeError> {
 
 /// Like [`decode_full`], but never decodes animation frames.
 ///
-/// For the still image only — frame one of an animated file, no `Animation`
+/// For the still image only â€” frame one of an animated file, no `Animation`
 /// attached. The prefetch thread calls this: it warms neighbours nobody has asked
 /// to *play* yet, and paying for every frame of every GIF in a folder would make
 /// prefetching them more expensive than not prefetching at all.
@@ -376,7 +381,7 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
     // The two animated formats take a different road from here: their decoder has
     // to be driven frame by frame, and the generic `decode()` below would throw the
     // rest of the file away after the first one. There is no falling back out of
-    // this branch — a GIF that turns out to hold a single frame comes back as an
+    // this branch â€” a GIF that turns out to hold a single frame comes back as an
     // ordinary still from the same code, just without an `Animation` attached.
     if want_animation
         && matches!(
@@ -392,21 +397,44 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
 
     let img = match probe.format() {
         Some(_) => probe.decode().map_err(img_err)?,
-        // Nothing with a magic number. SVG is the only format here that has none —
-        // it is XML, and text has nothing to sniff for — so it belongs at the end
+        // Nothing with a magic number. SVG is the only format here that has none â€”
+        // it is XML, and text has nothing to sniff for â€” so it belongs at the end
         // as the fallback rather than as another guess in the queue. A file that is
         // neither comes back as an SVG parse error, which is the more useful
         // message anyway: `image` would only say it did not recognise the format.
         None => {
             let mut reader = probe.into_inner();
             reader.rewind().map_err(io_err)?;
+
+            // PSD has a magic number, but `image` does not know the format â€”
+            // check for it before the SVG fallback claims the file.
+            let mut magic = [0u8; 4];
+            reader.read_exact(&mut magic).map_err(io_err)?;
+            reader.rewind().map_err(io_err)?;
+            if magic == *b"8BPS" {
+                return decode_psd(reader, orientation);
+            }
+
             let mut data = Vec::new();
             reader.read_to_end(&mut data).map_err(io_err)?;
 
-            let rendered = crate::svg::Svg::parse(&data)
-                .and_then(|svg| svg.render_fit())
-                .map_err(svg_err)?;
-            image::DynamicImage::ImageRgba8(rendered)
+            let svg = crate::svg::Svg::parse(&data).map_err(svg_err)?;
+            let rendered = svg.render_fit().map_err(svg_err)?;
+            let img = orientation.apply(image::DynamicImage::ImageRgba8(rendered));
+            let full_size = (img.width(), img.height());
+            let pixels = Arc::new(img.into_rgba8());
+            let has_transparency = has_transparency(&pixels);
+
+            return Ok(Decoded {
+                pixels,
+                stage: Stage::Full,
+                orientation,
+                full_size,
+                animation: None,
+                has_transparency,
+                // Kept so zooming past this raster can re-render sharper.
+                svg: Some(Arc::new(svg)),
+            });
         }
     };
 
@@ -421,7 +449,7 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
         orientation,
         full_size,
         animation: None,
-        has_transparency,
+        has_transparency,        svg: None,
     })
 }
 
@@ -431,7 +459,7 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
 /// multi-hundred-frame animation at screen resolution can outrun the entire cache
 /// budget on its own, and one file that evicts everything else it meets is a worse
 /// outcome than a file that plays only its first frame. The cap lands far above
-/// anything made to be watched — it is there for the pathological case.
+/// anything made to be watched â€” it is there for the pathological case.
 const MAX_ANIMATION_BYTES: usize = 512 * 1024 * 1024;
 
 /// Browsers treat a GIF delay of 10ms or less as "as fast as the author dared",
@@ -455,14 +483,14 @@ fn effective_delay(delay: image::Delay) -> Duration {
 /// Decode every frame of an animated GIF or WebP, composited to full canvas size.
 ///
 /// Always answers with a [`Decoded`]: animated when there is more than one frame,
-/// an ordinary still when there is not — so callers never re-decode a single-frame
+/// an ordinary still when there is not â€” so callers never re-decode a single-frame
 /// GIF through the static path. A file whose tail will not decode, or whose frames
 /// together would blow [`MAX_ANIMATION_BYTES`], still comes back whole: the frames
 /// gathered so far are kept and the `Animation` dropped, because half an animation
 /// loops wrong but its first frame is always correct.
 ///
 /// All frames are held in memory on purpose. Scrubbing needs random access, and
-/// neither codec offers seek-to-frame — the iterator is forward-only — so the only
+/// neither codec offers seek-to-frame â€” the iterator is forward-only â€” so the only
 /// way to jump backwards is to have already been there.
 fn decode_animation<R: BufRead + Seek>(
     reader: &mut R,
@@ -473,7 +501,7 @@ fn decode_animation<R: BufRead + Seek>(
     struct Collected {
         frames: Vec<Arc<image::RgbaImage>>,
         delays: Vec<Duration>,
-        /// False when collecting stopped early — a frame failed mid-file, or the
+        /// False when collecting stopped early â€” a frame failed mid-file, or the
         /// byte cap was hit. A partial frame set must not animate: looping it
         /// would play the head of an animation whose tail is missing.
         complete: bool,
@@ -493,7 +521,7 @@ fn decode_animation<R: BufRead + Seek>(
             let delay = effective_delay(frame.delay());
             out.frames.push(Arc::new(frame.into_buffer()));
             out.delays.push(delay);
-            // Not an error — the frames so far are fine — but there is no point
+            // Not an error â€” the frames so far are fine â€” but there is no point
             // decoding further into a set that will be dropped whole below.
             if out.frames.iter().map(|f| f.as_raw().len()).sum::<usize>() > MAX_ANIMATION_BYTES {
                 out.complete = false;
@@ -529,7 +557,7 @@ fn decode_animation<R: BufRead + Seek>(
 
     if frames.is_empty() {
         // Nothing decoded at all. With no pixels there is nothing to show, so a
-        // failure — however bland — is the honest answer.
+        // failure â€” however bland â€” is the honest answer.
         return Err(image_error(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "no decodable frames",
@@ -563,7 +591,7 @@ fn decode_animation<R: BufRead + Seek>(
             orientation,
             full_size,
             animation: Some(Arc::new(Animation { frames, delays })),
-            has_transparency,
+            has_transparency,            svg: None,
         })
     } else {
         Ok(Decoded {
@@ -572,11 +600,60 @@ fn decode_animation<R: BufRead + Seek>(
             orientation,
             full_size,
             animation: None,
-            has_transparency,
+            has_transparency,            svg: None,
         })
     }
 }
 
+/// Decode a PSD file: the flattened composite Photoshop writes for
+/// compatibility, not the layers. See [`crate::psd`] for what that means and
+/// what is supported.
+fn decode_psd<R: std::io::Read>(
+    mut reader: R,
+    orientation: Orientation,
+) -> Result<Decoded, DecodeError> {
+    let io_err = |source| DecodeError::Io {
+        path: String::new(),
+        source,
+    };
+
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).map_err(io_err)?;
+
+    let composite = crate::psd::composite(&data).map_err(|err| DecodeError::Image {
+        path: String::new(),
+        source: image::ImageError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            err.0,
+        )),
+    })?;
+
+    let Some(img) = image::RgbaImage::from_raw(composite.width, composite.height, composite.pixels)
+    else {
+        return Err(io_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad PSD size",
+        )));
+    };
+
+    // PSD files carry no EXIF; the orientation read earlier answered Normal and
+    // applying it is a no-op, but it keeps this path shaped like every other.
+    let img = orientation
+        .apply(image::DynamicImage::ImageRgba8(img))
+        .into_rgba8();
+    let full_size = (img.width(), img.height());
+    let pixels = Arc::new(img);
+    let has_transparency = has_transparency(&pixels);
+
+    Ok(Decoded {
+        pixels,
+        stage: Stage::Full,
+        orientation,
+        full_size,
+        animation: None,
+        has_transparency,        svg: None,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +810,112 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// Synthesise a minimal PSD: header, three empty sections, then the
+    /// flattened composite uncompressed and planar â€” the shape Photoshop writes
+    /// for a simple RGB document with no layers.
+    fn synthetic_psd(
+        name: &str,
+        width: u32,
+        height: u32,
+        channels: u16,
+        pixels: &[u8],
+    ) -> std::path::PathBuf {
+        use std::io::Write as _;
+
+        let path = temp_path(name);
+        let mut file = File::create(&path).unwrap();
+        let mut put = |bytes: &[u8]| file.write_all(bytes).unwrap();
+
+        put(b"8BPS");
+        put(&1u16.to_be_bytes()); // version: PSD
+        put(&[0; 6]); // reserved
+        put(&channels.to_be_bytes());
+        put(&height.to_be_bytes());
+        put(&width.to_be_bytes());
+        put(&8u16.to_be_bytes()); // depth
+        put(&3u16.to_be_bytes()); // colour mode: RGB
+        put(&0u32.to_be_bytes()); // colour mode data: empty
+        put(&0u32.to_be_bytes()); // image resources: empty
+        put(&0u32.to_be_bytes()); // layer and mask info: empty (flattened)
+        put(&0u16.to_be_bytes()); // compression: none
+        put(pixels);
+        path
+    }
+
+    #[test]
+    fn reads_a_flattened_psd() {
+        // 2x1 RGB, planar: all of R, then all of G, then all of B. Photoshop
+        // stores the composite one channel at a time, never interleaved.
+        let path = synthetic_psd("flat.psd", 2, 1, 3, &[200, 40, 220, 90, 10, 20]);
+
+        let decoded = decode_full(&path).unwrap();
+        assert_eq!(decoded.size(), (2, 1));
+        assert_eq!(decoded.pixels.get_pixel(0, 0).0, [200, 220, 10, 255]);
+        assert_eq!(decoded.pixels.get_pixel(1, 0).0, [40, 90, 20, 255]);
+        // The composite Photoshop writes is opaque unless the document has alpha.
+        assert!(!decoded.has_transparency);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn reads_a_psd_with_alpha() {
+        // 1x2 RGBA, planar: R=[1,4], G=[2,5], B=[3,6], A=[255,128] — one pixel
+        // half-transparent, one fully clear.
+        let path = synthetic_psd("alpha.psd", 1, 2, 4, &[1, 4, 2, 5, 3, 6, 255, 128]);
+
+        let decoded = decode_full(&path).unwrap();
+        assert_eq!(decoded.pixels.get_pixel(0, 0).0, [1, 2, 3, 255]);
+        assert_eq!(decoded.pixels.get_pixel(0, 1).0, [4, 5, 6, 128]);
+        assert!(decoded.has_transparency);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_truncated_psd_is_an_error_not_a_crash() {
+        let path = synthetic_psd("short.psd", 8, 8, 3, &[0; 10]);
+        assert!(decode_full(&path).is_err());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn reads_an_rle_psd_the_way_photoshop_writes_it() {
+        // 2x1 RGB, PackBits per row per channel. A repeat run of two is code
+        // 255 followed by the value, so each channel's row is three bytes:
+        // [255, R], [255, G], [255, B], preceded by one u16 count per row.
+        use std::io::Write as _;
+
+        let path = temp_path("rle.psd");
+        let mut file = File::create(&path).unwrap();
+        let mut put = |bytes: &[u8]| file.write_all(bytes).unwrap();
+        put(b"8BPS");
+        put(&1u16.to_be_bytes());
+        put(&[0; 6]);
+        put(&3u16.to_be_bytes());
+        put(&1u32.to_be_bytes());
+        put(&2u32.to_be_bytes());
+        put(&8u16.to_be_bytes());
+        put(&3u16.to_be_bytes());
+        put(&0u32.to_be_bytes());
+        put(&0u32.to_be_bytes());
+        put(&0u32.to_be_bytes());
+        put(&1u16.to_be_bytes()); // compression: RLE
+        put(&2u16.to_be_bytes()); // one count per row per channel: three rows
+        put(&2u16.to_be_bytes());
+        put(&2u16.to_be_bytes());
+        put(&[255, 200]); // R = 200, 200
+        put(&[255, 220]); // G = 220, 220
+        put(&[255, 10]); // B = 10, 10
+
+        let decoded = decode_full(&path).unwrap();
+        assert_eq!(decoded.pixels.get_pixel(0, 0).0, [200, 220, 10, 255]);
+        assert_eq!(decoded.pixels.get_pixel(1, 0).0, [200, 220, 10, 255]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[test]
     fn reads_tiff() {
         // What scanners and Photoshop write, and the reason this extension is on the
@@ -805,7 +988,7 @@ mod tests {
         // is measured on, and until now nothing here could open one. A file that
         // Windows reads but this app cannot would be a poor advertisement for it.
         // 256 square, so the file carries the one PNG-compressed entry as well as
-        // the BMP ladder below it — and it is the PNG entry a decoder is likeliest
+        // the BMP ladder below it â€” and it is the PNG entry a decoder is likeliest
         // to choke on. A smaller source would skip it: the encoder never upscales.
         let path = temp_path("written.ico");
         let src =
@@ -863,7 +1046,7 @@ mod tests {
         assert_eq!(animation.len(), 2);
         // Both frames composite to the canvas size, never to a sub-rectangle.
         assert!(animation.frames.iter().all(|f| f.dimensions() == (6, 4)));
-        // `pixels` is frame zero — the thing every static code path acts on.
+        // `pixels` is frame zero â€” the thing every static code path acts on.
         assert_eq!(decoded.pixels.get_pixel(0, 0).0, [255, 0, 0, 255]);
         assert_eq!(
             animation.frames[1].get_pixel(0, 0).0,
@@ -886,7 +1069,7 @@ mod tests {
         let per_frame = 6 * 4 * 4;
         assert_eq!(decoded.byte_size(), per_frame * 2);
 
-        // The static decode of the same file carries no frame set at all —
+        // The static decode of the same file carries no frame set at all â€”
         // prefetch must not pay twice for pixels it cannot play yet.
         let static_only = decode_full_static(&path).unwrap();
         assert!(static_only.animation.is_none());

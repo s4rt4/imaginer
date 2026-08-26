@@ -14,6 +14,7 @@ pub mod edit;
 pub mod export;
 pub mod folder;
 pub mod metadata;
+pub mod psd;
 pub mod settings;
 pub mod svg;
 pub mod thumbs;

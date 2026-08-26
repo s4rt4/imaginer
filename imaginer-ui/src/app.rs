@@ -202,6 +202,17 @@ pub struct App {
     /// The transparency checker, uploaded the first time a picture with
     /// see-through pixels is shown. Most sessions never ask for it.
     checker: Option<egui::TextureHandle>,
+    /// The parsed vector artwork behind the image on screen, when it is an SVG.
+    /// Held here so zooming past the current raster's resolution can ask for a
+    /// sharper one; `Decoded.svg` moves here on arrival.
+    svg: Option<Arc<imaginer_core::svg::Svg>>,
+    /// Longest side, in texels, of the SVG raster currently on screen. What the
+    /// re-render threshold is measured against.
+    svg_side: u32,
+    /// Where a zoom-triggered re-render reports back. One channel per request,
+    /// so a render the user has already zoomed past has nowhere to land.
+    svg_rx: Receiver<Result<image::RgbaImage, String>>,
+    svg_rendering: bool,
     icons: Icons,
     /// Decoded images kept around, and the thread that decodes the ones nobody has
     /// asked for yet.
@@ -285,6 +296,10 @@ impl App {
             clipboard_busy: false,
             logotype: None,
             checker: None,
+            svg: None,
+            svg_side: 0,
+            svg_rx: std::sync::mpsc::channel().1,
+            svg_rendering: false,
             icons: Icons::default(),
             prefetch: Prefetcher::with_budget(cache_budget()),
             nav: NavTrace::new(),
@@ -392,6 +407,13 @@ impl App {
         self.scrubbing = false;
         self.playing_before_scrub = false;
 
+        // A vector artwork belongs to its file, and so does the raster
+        // resolution it was last drawn at.
+        self.svg = None;
+        self.svg_side = 0;
+        self.svg_rendering = false;
+        self.svg_rx = std::sync::mpsc::channel().1;
+
         // The EXIF block describes the file it came out of, so it goes with it. Not
         // read here: the panel is usually shut, and opening a file a second time to
         // fill a panel nobody is looking at is work on the navigation path.
@@ -477,6 +499,7 @@ impl App {
                 full_size,
                 animation: None,
                 has_transparency,
+                svg: None,
             },
         );
 
@@ -506,6 +529,8 @@ impl App {
         let name = format!("image-{}", self.texture_generation);
         let stage = decoded.stage;
         let animation = decoded.animation.clone();
+        let svg = decoded.svg.clone();
+        let decoded_size = decoded.size();
         self.stage = Some(stage);
         self.texture = Some(texture::upload(ctx, &name, &decoded));
         self.error = None;
@@ -538,8 +563,8 @@ impl App {
         }
 
         // An animated decode starts playing the moment it lands; anything else
-        // leaves playback parked. Frame zero is what was just uploaded â€” `pixels`
-        // *is* frame zero â€” so arming the deadline is all starting takes.
+        // leaves playback parked. Frame zero is what was just uploaded — `pixels`
+        // *is* frame zero — so arming the deadline is all starting takes.
         self.animation = animation;
         self.anim_frame = 0;
         if let Some(anim) = self.animation.as_ref() {
@@ -549,6 +574,17 @@ impl App {
             self.anim_playing = false;
             self.anim_due = None;
         }
+
+        // A vector file hands over its parsed artwork along with the first
+        // rasterisation of it; everything else has nothing to re-render.
+        self.svg = svg;
+        self.svg_side = if self.svg.is_some() {
+            let (w, h) = decoded_pixels_dims;
+            w.max(h)
+        } else {
+            0
+        };
+    }
     }
 
     fn poll_decode(&mut self, ctx: &egui::Context) {

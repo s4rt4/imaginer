@@ -223,6 +223,7 @@ mod tests {
             full_size: (side, side),
             animation: None,
             has_transparency: false,
+            svg: None,
         }
     }
 

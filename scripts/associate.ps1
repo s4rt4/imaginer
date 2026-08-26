@@ -59,9 +59,10 @@ if (-not $Exe) {
 # Mirrors imaginer_core::SUPPORTED_EXTENSIONS — see install-shell-integration.ps1
 # for why the two lists must move together. .ff (farbfeld) is left out of the
 # association: nothing on this machine produces one, and an association for a
-# format nothing opens is clutter in the Open-with list.
+# format nothing opens is clutter in the Open-with list. .psd opens the
+# flattened composite, which is what the app decodes.
 $extensions = @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp',
-                '.tif', '.tiff', '.ico', '.svg', '.svgz')
+                '.tif', '.tiff', '.ico', '.svg', '.svgz', '.psd')
 
 $progId = 'Imaginer.AssocFile'
 $classesKey = "HKCU:\Software\Classes"
