@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::decode::Decoded;
 
@@ -52,6 +52,11 @@ impl Stamp {
     /// Size of the file on disk, in bytes.
     pub fn file_size(&self) -> u64 {
         self.file_size
+    }
+
+    /// When the file was last written, as far as the filesystem says.
+    pub fn modified(&self) -> SystemTime {
+        self.modified.unwrap_or(UNIX_EPOCH)
     }
 }
 

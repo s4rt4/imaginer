@@ -151,6 +151,11 @@ fn warm_one(path: &Path, cache: &Mutex<ImageCache>) {
         return;
     };
 
+    // The same thumbnail the viewer's own decode would write — written here so
+    // a folder walked once is fast to walk again even where the viewer never
+    // lingered. Fire-and-forget; see `thumbs::ensure`.
+    imaginer_core::thumbs::ensure(path, &decoded.pixels);
+
     // Re-checked implicitly by `insert`, which replaces rather than duplicates: the
     // viewer may well have decoded this very image itself while this ran.
     lock(cache).insert(path.to_owned(), stamp, decoded);

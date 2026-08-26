@@ -282,6 +282,33 @@ fn thumbnail_field(exif: &exif::Exif, tag: exif::Tag) -> Option<usize> {
         .map(|v| v as usize)
 }
 
+/// Try the on-disk thumbnail cache, the fallback behind [`decode_preview`].
+///
+/// Files without an EXIF thumbnail — screenshots, PNGs, anything downloaded —
+/// used to have no fast first paint at all: every open paid the full decode
+/// before anything appeared. Once this app has decoded a file once, its
+/// quarter-megapixel stand-in lives on disk keyed by path, size and mtime, and
+/// a later open of the same version starts from there.
+///
+/// Like the EXIF preview this is best-effort: `None` just means the caller
+/// waits for the full decode as it always had to.
+pub fn decode_thumb(path: &Path) -> Option<Decoded> {
+    let pixels = crate::thumbs::load(path)?;
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let orientation = metadata::read_orientation(&mut reader);
+    // Thumbnails are stored already oriented, so `full_size` is the only
+    // layout fact still needed — and it comes from the header, not the decode.
+    let full_size = oriented_dimensions(path, orientation)?;
+
+    Some(Decoded {
+        pixels: Arc::new(pixels),
+        stage: Stage::Preview,
+        orientation,
+        full_size,
+        animation: None,
+    })
+}
+
 /// Fully decode an image at native resolution, corrected for EXIF orientation.
 ///
 /// Animated GIFs and WebPs come back with their whole frame set attached; see

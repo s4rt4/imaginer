@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use imaginer_core::{Decoded, decode_full, decode_full_static, decode_preview};
+use imaginer_core::{Decoded, decode_full, decode_full_static, decode_preview, decode_thumb};
 
 /// What the decode thread sends back to the UI.
 pub enum LoadMessage {
@@ -154,14 +154,18 @@ fn flag_disabled(name: &str) -> bool {
 /// Decode in two passes: the embedded EXIF thumbnail first if there is one, then
 /// the real image. The viewer shows whichever arrives first.
 ///
-/// For an animated file the full decode is itself split in two, and for the same
-/// reason the thumbnail is: a GIF's whole frame set can take far longer to decode
-/// than its first frame, and a window that waits for all of it before painting
-/// anything is exactly what this startup exists to avoid. So the still arrives as
-/// an ordinary `Loaded` and plays nothing; the frame set follows as a second
-/// message for the same image, which the viewer swaps in without touching layout.
+/// The EXIF thumbnail is not the only fast lane: files that carry none —
+/// screenshots, PNGs, downloads — get one from the on-disk thumbnail cache,
+/// written by an earlier session's decode of the very same file. And for an
+/// animated file the full decode is itself split in two, for the same reason
+/// the thumbnail is: a GIF's whole frame set can take far longer to decode than
+/// its first frame, and a window that waits for all of it before painting
+/// anything is exactly what this startup exists to avoid. So the still arrives
+/// as an ordinary `Loaded` and plays nothing; the frame set follows as a second
+/// message for the same image, which the viewer swaps in without touching
+/// layout.
 fn decode_into(path: PathBuf, tx: &mpsc::Sender<LoadMessage>) {
-    if let Some(preview) = decode_preview(&path) {
+    if let Some(preview) = decode_preview(&path).or_else(|| decode_thumb(&path)) {
         // A dropped receiver just means the window closed; stop rather than
         // spending time on a full decode nobody will see.
         if tx.send(LoadMessage::Loaded(preview)).is_err() {
@@ -169,12 +173,21 @@ fn decode_into(path: PathBuf, tx: &mpsc::Sender<LoadMessage>) {
         }
     }
 
-    let message = match decode_full_static(&path) {
-        Ok(decoded) => LoadMessage::Loaded(decoded),
+    let still = decode_full_static(&path);
+    let message = match &still {
+        Ok(decoded) => LoadMessage::Loaded(decoded.clone()),
         Err(err) => LoadMessage::Failed(err.to_string()),
     };
     if tx.send(message).is_err() {
         return;
+    }
+
+    // This decode is the moment a thumbnail gets written for next time: a
+    // background thread is already holding the full pixels, and the marginal
+    // cost is one 256px encode. The EXIF thumbnail of a camera file may already
+    // have served; a cached one serves every file the same way.
+    if let Ok(decoded) = &still {
+        imaginer_core::thumbs::ensure(&path, &decoded.pixels);
     }
 
     if let Ok(animated) = decode_full(&path)
