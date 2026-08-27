@@ -16,8 +16,10 @@ use imaginer_core::{Order, SortKey};
 
 use crate::icons::{self, Icon, Icons};
 
-/// Same width as the edit sidebar: one strip of the window, one width.
-pub const WIDTH: f32 = 244.0;
+/// Wider than the edit sidebar it shares the strip with: the shortcut table
+/// needs a monospace key column and its descriptions side by side, and at 244
+/// both were truncated into nonsense.
+pub const WIDTH: f32 = 300.0;
 
 /// What the panel can ask the app to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +41,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+O", "Open an image"),
     ("Ctrl+Shift+O", "Open a folder"),
     ("← / →", "Previous / next image"),
-    ("Space", "Slideshow, or play an animation"),
+    ("Space", "Slideshow / animation"),
     ("F11", "Fullscreen"),
     ("Esc", "Back out, or close"),
     ("F or 0", "Fit to window"),
@@ -81,11 +83,17 @@ pub fn show(ui: &mut egui::Ui, icons: &mut Icons, state: &mut State<'_>) -> Opti
             });
             ui.add_space(8.0);
 
-            if let Some(requested) = preferences(ui, state) {
-                action = Some(requested);
-            }
-            ui.add_space(14.0);
-            shortcuts(ui);
+            // The two halves together stand taller than the window: without the
+            // scroll the last rows of the shortcut table were simply gone.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if let Some(requested) = preferences(ui, state) {
+                        action = Some(requested);
+                    }
+                    ui.add_space(14.0);
+                    shortcuts(ui);
+                });
         });
 
     action

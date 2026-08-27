@@ -32,6 +32,15 @@ const NOTICE_DURATION: Duration = Duration::from_secs(3);
 /// sooner for it.
 const PREFETCH_RADIUS: usize = 1;
 
+/// How much slack the SVG raster on screen must lose before a sharper one is
+/// asked for. Re-rendering at every wheel notch would burn CPU for half the
+/// zooms nobody squints at; 50% headroom means each render serves a real span.
+const SVG_SHARPEN_FACTOR: f32 = 1.5;
+
+/// How far past what the screen shows a fresh SVG raster aims, so ordinary
+/// zoom adjustments inside the same view never trigger a second render.
+const SVG_OVERRENDER: f32 = 1.25;
+
 /// What the clipboard worker has to report.
 enum ClipboardResult {
     Copied,
@@ -211,7 +220,7 @@ pub struct App {
     svg_side: u32,
     /// Where a zoom-triggered re-render reports back. One channel per request,
     /// so a render the user has already zoomed past has nowhere to land.
-    svg_rx: Receiver<Result<image::RgbaImage, String>>,
+    svg_rx: Receiver<Result<imaginer_core::image::RgbaImage, String>>,
     svg_rendering: bool,
     icons: Icons,
     /// Decoded images kept around, and the thread that decodes the ones nobody has
@@ -579,12 +588,11 @@ impl App {
         // rasterisation of it; everything else has nothing to re-render.
         self.svg = svg;
         self.svg_side = if self.svg.is_some() {
-            let (w, h) = decoded_pixels_dims;
+            let (w, h) = decoded_size;
             w.max(h)
         } else {
             0
         };
-    }
     }
 
     fn poll_decode(&mut self, ctx: &egui::Context) {
@@ -612,6 +620,82 @@ impl App {
                     self.loading = false;
                     break;
                 }
+            }
+        }
+    }
+
+    /// Keep the vector picture on screen sharp as the user zooms into it.
+    ///
+    /// The trigger side measures the canvas against how big it is actually being
+    /// drawn — zoom times points-per-pixel over the SVG's natural size says how
+    /// many screen pixels the longest side fills — and asks the worker for a
+    /// raster with headroom when the one up has less than
+    /// [`SVG_SHARPEN_FACTOR`] to spare. This is also the receiver half: when a
+    /// sharper raster lands it swaps in without touching `source_size`, so more
+    /// detail arrives inside the very same rectangle and nothing refits.
+    ///
+    /// Geometry edits suspend the whole loop: their output replaces the canvas
+    /// with pixels no longer ruled by the artwork, and re-rendering past a crop
+    /// would erase the crop.
+    fn poll_svg(&mut self, ctx: &egui::Context) {
+        let trace_svg = std::env::var_os("IMAGINER_TRACE_SVG").is_some_and(|v| v != "0");
+        if self.svg_rendering {
+            match self.svg_rx.try_recv() {
+                Ok(Ok(pixels)) => {
+                    let wanted = self.svg.is_some() && self.edits.is_empty();
+                    if wanted && let Some(texture) = self.texture.as_mut() {
+                        let source_size = texture.source_size;
+                        self.texture_generation += 1;
+                        let name = format!("image-{}", self.texture_generation);
+                        *texture = texture::upload_pixels(ctx, &name, &pixels);
+                        texture.source_size = source_size;
+                        self.svg_side = pixels.width().max(pixels.height());
+                        if trace_svg {
+                            eprintln!("svg: sharpened raster in, side={}", self.svg_side);
+                        }
+                    }
+                    self.svg_rendering = false;
+                    ctx.request_repaint();
+                }
+                Ok(Err(_)) => self.svg_rendering = false,
+                Err(TryRecvError::Empty) => {
+                    // Nothing to paint yet; wake again rather than idling until
+                    // the next input event happens to arrive.
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+                Err(TryRecvError::Disconnected) => self.svg_rendering = false,
+            }
+        }
+
+        if !self.svg_rendering
+            && !self.loading
+            && self.edits.is_empty()
+            && self.crop.is_none()
+            && let Some(svg) = self.svg.clone()
+            && let Some(texture) = self.texture.as_ref()
+        {
+            let ppp = ctx.pixels_per_point();
+            let (width, height) = texture.source_size;
+            let needed = width.max(height) as f32 * self.last_zoom * ppp;
+            let target = (needed * SVG_OVERRENDER)
+                .min(imaginer_core::svg::MAX_SIDE as f32)
+                .ceil() as u32;
+            if needed > self.svg_side as f32 * SVG_SHARPEN_FACTOR && target > self.svg_side {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.svg_rx = rx;
+                self.svg_rendering = true;
+                if trace_svg {
+                    eprintln!(
+                        "svg: raster side={} needs {:.0}px, asking for {}",
+                        self.svg_side, needed, target
+                    );
+                }
+                std::thread::Builder::new()
+                    .name("svg-sharpen".into())
+                    .spawn(move || {
+                        let _ = tx.send(svg.render_longest(target).map_err(|err| err.to_string()));
+                    })
+                    .ok();
             }
         }
     }
@@ -1978,6 +2062,10 @@ impl eframe::App for App {
         if let Some(action) = requested_timeline {
             self.apply_timeline(&ctx, action);
         }
+
+        // After the canvas: the sharpen trigger reads `last_zoom`, which the
+        // central panel's draw of this very frame filled in.
+        self.poll_svg(&ctx);
 
         self.trace.mark_first_frame();
 

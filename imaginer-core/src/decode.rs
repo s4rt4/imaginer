@@ -742,6 +742,7 @@ mod tests {
             full_size: (64, 16),
             animation: None,
             has_transparency: false,
+            svg: None,
         };
 
         let (w, h, bytes) = decoded.for_upload(16384);
