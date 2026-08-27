@@ -81,6 +81,11 @@ pub fn show(ui: &mut egui::Ui, icons: &mut Icons, state: &mut State<'_>) -> Opti
                     }
                 });
             });
+            ui.label(
+                egui::RichText::new(concat!("Imaginer ", env!("CARGO_PKG_VERSION")))
+                    .weak()
+                    .small(),
+            );
             ui.add_space(8.0);
 
             // The two halves together stand taller than the window: without the

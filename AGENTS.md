@@ -113,7 +113,10 @@ startup investigation closed (~900ms floor, premise vs nomacs survives); EXIF in
 panel (`c490875`); golden-image tests for edit ops (`55e2613`); TIFF/ICO/farbfeld
 decode (`5f44fe7`); SVG open via resvg, logo through the same code (`d701827`);
 animated GIF/WebP playback + timeline scrub (see animation notes below);
-SVG sharpen-on-zoom + settings panel scroll (`11938ac`, resolves bug.md 2026-08-26).
+SVG sharpen-on-zoom + settings panel scroll (`11938ac`, resolves bug.md 2026-08-26);
+JXL decode via jxl-oxide (sample in Downloads drives an `#[ignore]` test);
+NSIS installer (`packaging/installer.nsi` + `examples/make-installer-assets.rs`);
+version shown in the settings panel and in the exe's version resource.
 
 ## SVG sharpen-on-zoom (landed 2026-08-27, `11938ac`)
 

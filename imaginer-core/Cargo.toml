@@ -44,6 +44,7 @@ resvg = "0.47"
 # and `image-webp` is lossless-only, and lossless defeats the point: the reason to
 # write WebP here is a smaller file for the web.
 webp = "0.3.1"
+jxl-oxide = "0.12.6"
 
 # PSD is parsed by hand in `psd.rs` — the flattened composite Photoshop writes
 # for compatibility is a header, three skip-lengths and planar samples (raw or

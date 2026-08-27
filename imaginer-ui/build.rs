@@ -108,6 +108,8 @@ fn embed_executable_icon(svg_path: &Path, out_dir: &Path) {
         .set("ProductName", "Imaginer")
         .set("FileDescription", "Imaginer — image viewer and converter")
         .set("OriginalFilename", "imaginer.exe")
+        .set("FileVersion", env!("CARGO_PKG_VERSION"))
+        .set("ProductVersion", env!("CARGO_PKG_VERSION"))
         .set("LegalCopyright", "MIT licensed — see LICENSE")
         .compile()
         .unwrap_or_else(|err| {

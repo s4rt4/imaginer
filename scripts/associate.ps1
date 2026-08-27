@@ -60,9 +60,10 @@ if (-not $Exe) {
 # for why the two lists must move together. .ff (farbfeld) is left out of the
 # association: nothing on this machine produces one, and an association for a
 # format nothing opens is clutter in the Open-with list. .psd opens the
-# flattened composite, which is what the app decodes.
+# flattened composite, which is what the app decodes. .jxl is associated for
+# the same reason .psd is: files exist in the wild (Unsplash serves them).
 $extensions = @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp',
-                '.tif', '.tiff', '.ico', '.svg', '.svgz', '.psd')
+                '.tif', '.tiff', '.ico', '.svg', '.svgz', '.psd', '.jxl')
 
 $progId = 'Imaginer.AssocFile'
 $classesKey = "HKCU:\Software\Classes"

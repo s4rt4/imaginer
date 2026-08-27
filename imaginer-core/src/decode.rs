@@ -30,6 +30,7 @@ use crate::metadata::{self, Orientation};
 /// not offering it.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "ff", "svg", "svgz", "psd",
+    "jxl",
 ];
 
 /// Whether `path` looks like something this build can open.
@@ -65,6 +66,12 @@ pub enum DecodeError {
         path: String,
         #[source]
         source: crate::svg::SvgError,
+    },
+    #[error("could not decode {path}: {source}")]
+    Jxl {
+        path: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -367,6 +374,10 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
         path: path.display().to_string(),
         source,
     };
+    let jxl_err = |source| DecodeError::Jxl {
+        path: path.display().to_string(),
+        source,
+    };
 
     let mut reader = BufReader::new(File::open(path).map_err(io_err)?);
     let orientation = metadata::read_orientation(&mut reader);
@@ -406,13 +417,16 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
             let mut reader = probe.into_inner();
             reader.rewind().map_err(io_err)?;
 
-            // PSD has a magic number, but `image` does not know the format â€”
-            // check for it before the SVG fallback claims the file.
-            let mut magic = [0u8; 4];
+            // PSD and JPEG XL both have magic numbers, but `image` knows neither
+            // format â€” check for them before the SVG fallback claims the file.
+            let mut magic = [0u8; 12];
             reader.read_exact(&mut magic).map_err(io_err)?;
             reader.rewind().map_err(io_err)?;
-            if magic == *b"8BPS" {
+            if magic[0..4] == *b"8BPS" {
                 return decode_psd(reader, orientation);
+            }
+            if magic[0..2] == [0xFF, 0x0A] || magic == JXL_CONTAINER_SIGNATURE {
+                return decode_jxl(reader, orientation, jxl_err);
             }
 
             let mut data = Vec::new();
@@ -603,6 +617,69 @@ fn decode_animation<R: BufRead + Seek>(
             has_transparency,            svg: None,
         })
     }
+}
+
+/// The JPEG XL container signature — an ISOBMFF box announcing the codestream.
+const JXL_CONTAINER_SIGNATURE: [u8; 12] = [
+    0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
+];
+
+/// Decode a JPEG XL file: the first keyframe, at native resolution.
+///
+/// `jxl-oxide` applies the file's own orientation while rendering (see
+/// `Render::stream`), so what arrives here is already upright and the EXIF
+/// orientation read earlier would only flip it twice.
+fn decode_jxl<R: std::io::Read>(
+    reader: R,
+    _orientation: Orientation,
+    jxl_err: impl Fn(Box<dyn std::error::Error + Send + Sync>) -> DecodeError,
+) -> Result<Decoded, DecodeError> {
+    let image = jxl_oxide::JxlImage::builder().read(reader).map_err(&jxl_err)?;
+    // Frame zero is the still a viewer cares about; animated JXL (rare) shows
+    // its first keyframe like any other picture for now.
+    let render = image.render_frame(0).map_err(&jxl_err)?;
+    let mut stream = render.stream();
+
+    let (width, height) = (stream.width(), stream.height());
+    let channels = stream.channels() as usize;
+    let mut bytes = vec![0u8; width as usize * height as usize * channels];
+    stream.write_to_buffer(&mut bytes);
+
+    // The buffer is interleaved in the channel order the pixel format says,
+    // which is exactly the memory layout of the matching `image` type.
+    let build = |b: Vec<u8>| -> Option<image::DynamicImage> {
+        Some(match channels {
+            1 => image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(width, height, b)?),
+            2 => {
+                image::DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_raw(width, height, b)?)
+            }
+            3 => image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(width, height, b)?),
+            4 => image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(width, height, b)?),
+            _ => None?,
+        })
+    };
+    let img = build(bytes).ok_or_else(|| {
+        DecodeError::Io {
+            path: String::new(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "jxl buffer does not match its dimensions",
+            ),
+        }
+    })?;
+    let full_size = (img.width(), img.height());
+    let pixels = Arc::new(img.into_rgba8());
+    let has_transparency = has_transparency(&pixels);
+
+    Ok(Decoded {
+        pixels,
+        stage: Stage::Full,
+        orientation: Orientation::Normal,
+        full_size,
+        animation: None,
+        has_transparency,
+        svg: None,
+    })
 }
 
 /// Decode a PSD file: the flattened composite Photoshop writes for
@@ -944,6 +1021,47 @@ mod tests {
 
         assert_eq!(decoded.size(), (3, 2));
         assert_eq!(decoded.pixels.get_pixel(0, 0).0, [0xab, 0x10, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn a_jxl_extension_is_listed_as_openable() {
+        assert!(is_supported(Path::new("photo.jxl")));
+        assert!(is_supported(Path::new("PHOTO.JXL")));
+    }
+
+    #[test]
+    fn a_jxl_file_with_a_broken_codestream_is_a_jxl_error_not_an_svg_parse() {
+        // The dispatch order worth pinning: both signatures precede the SVG
+        // fallback, and the error naming the right format is what proves the
+        // file reached the JXL decoder rather than being parsed as XML.
+        for signature in [
+            JXL_CONTAINER_SIGNATURE.to_vec(),
+            vec![0xFF, 0x0A],
+        ] {
+            let path = temp_path("probe.jxl");
+            std::fs::write(&path, [signature, b"certainly not jxl".to_vec()].concat()).unwrap();
+
+            match decode_full(&path) {
+                Err(DecodeError::Jxl { .. }) => {}
+                other => panic!("expected a Jxl error, got {other:?}"),
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    /// Exercises the real decoder against a real file, kept out of the default
+    /// run because the sample lives outside the repository.
+    #[test]
+    #[ignore = "needs the sample file in Downloads"]
+    fn decodes_the_jxl_sample() {
+        let path = Path::new("C:\\Users\\Sarta\\Downloads\\zoltan-tasi-CLJeQCr2F_A-unsplash.jxl");
+        let decoded = decode_full(path).expect("the sample should decode");
+
+        assert!(decoded.pixels.width() > 0 && decoded.pixels.height() > 0);
+        assert_eq!(decoded.size(), (decoded.pixels.width(), decoded.pixels.height()));
+        // The photo has no see-through pixels; a decode that says otherwise
+        // means the channel order came back scrambled.
+        assert!(!decoded.has_transparency);
     }
 
     #[test]
