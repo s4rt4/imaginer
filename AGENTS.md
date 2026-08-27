@@ -112,7 +112,22 @@ shader verified (`examples/verify-adjust-shader.rs`, real GPU, worst diff 1 vs C
 startup investigation closed (~900ms floor, premise vs nomacs survives); EXIF info
 panel (`c490875`); golden-image tests for edit ops (`55e2613`); TIFF/ICO/farbfeld
 decode (`5f44fe7`); SVG open via resvg, logo through the same code (`d701827`);
-animated GIF/WebP playback + timeline scrub (see animation notes below).
+animated GIF/WebP playback + timeline scrub (see animation notes below);
+SVG sharpen-on-zoom + settings panel scroll (`11938ac`, resolves bug.md 2026-08-26).
+
+## SVG sharpen-on-zoom (landed 2026-08-27, `11938ac`)
+
+- `poll_svg` in `app.rs` runs at the end of every `ui()` (after the canvas fills
+  `last_zoom`). Trigger: `natural_longest * zoom * ppp > svg_side * 1.5` → worker
+  thread calls `svg.render_longest(min(needed*1.25, MAX_SIDE))`; arrival swaps the
+  texture via `upload_pixels` but restores the old `source_size`, so the sharper
+  raster lands in the same rectangle and nothing refits.
+- Suspended by geometry edits (`edits.is_empty()` guard) — re-rendering over a crop
+  would erase it. `IMAGINER_TRACE_SVG=1` prints the ask and the arrival lines.
+- Zoom for SVGs is relative to the *raster* (full_size = the 1024 render), so the
+  threshold crosses quickly; escalation observed 1024 → 1966 → 3839 → 4096 (cap).
+- The toolbar "100%" is the Actual-size *button*, not a zoom readout — the readout
+  lives in the status bar (off-screen in screenshots at default window size).
 
 ## Animation notes (animated GIF/WebP, landed 2026-08-26)
 
