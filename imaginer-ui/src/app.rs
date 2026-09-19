@@ -32,6 +32,12 @@ const NOTICE_DURATION: Duration = Duration::from_secs(3);
 /// direction â€” and the image that matters, the very next one, would be finished no
 /// sooner for it.
 const PREFETCH_RADIUS: usize = 1;
+/// How long a decode runs before the status bar admits to it.
+///
+/// Short enough that a slow format does not sit silent, long enough that the
+/// ordinary case — a JPEG, a step through a warmed cache — never flashes a word
+/// on screen for two frames. Flicker in a status bar reads as a bug in the app.
+const DECODE_NOTICE: Duration = Duration::from_millis(150);
 
 /// What the clipboard worker has to report.
 enum ClipboardResult {
@@ -112,6 +118,14 @@ pub struct App {
     stamp: Option<Stamp>,
     /// True while a decode is in flight, which is also what drives repainting.
     loading: bool,
+    /// When that decode started, for the status bar's "decoding…".
+    ///
+    /// Only formats with no preview stage ever reach the threshold: a JPEG puts
+    /// its EXIF thumbnail up in a few milliseconds, while a 4K AVIF, a large PSD
+    /// or a JXL decodes in one go with nothing to show meanwhile — and the
+    /// canvas holds the *previous* picture while it does, which without a word
+    /// anywhere looks like a viewer that ignored the keypress.
+    loading_since: Option<Instant>,
     /// Bumped per load so each texture gets a distinct name in egui's texture manager.
     texture_generation: u64,
     last_zoom: f32,
@@ -203,6 +217,8 @@ pub struct App {
     /// Whether the about box is up. Not a setting, so it is not persisted: a
     /// session that opened it once has read it.
     about_open: bool,
+    /// The last title sent to the window, so the same one is not sent twice.
+    title: Option<String>,
     /// The transparency backdrops, each uploaded the first time a picture with
     /// see-through pixels calls for it. Most sessions never ask for either.
     /// Checker for sampled images, diagonals for vector ones — which is a
@@ -255,6 +271,7 @@ impl App {
             trace,
             stamp: path.as_deref().and_then(Stamp::of),
             loading: path.is_some(),
+            loading_since: path.is_some().then(Instant::now),
             path,
             rx,
             texture: None,
@@ -300,6 +317,7 @@ impl App {
             clipboard_busy: false,
             logotype: None,
             about_open: false,
+            title: None,
             checker: None,
             hatch: None,
             vector: vector::Zoom::default(),
@@ -451,6 +469,7 @@ impl App {
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.rx = rx;
                 self.loading = true;
+                self.loading_since = Some(Instant::now());
                 std::thread::Builder::new()
                     .name("decode".to_owned())
                     .spawn(move || decode_into(path, &tx))
@@ -596,6 +615,7 @@ impl App {
                 Ok(LoadMessage::Failed(message)) => {
                     self.error = Some(message);
                     self.loading = false;
+                    self.loading_since = None;
                     // Now the previous image does have to go: leaving it up beside
                     // the new filename would claim to be a file that would not open.
                     if self.awaiting_first_frame {
@@ -612,6 +632,7 @@ impl App {
                 // last would strand the frame set in the channel.
                 Err(TryRecvError::Disconnected) => {
                     self.loading = false;
+                    self.loading_since = None;
                     break;
                 }
             }
@@ -672,7 +693,16 @@ impl App {
 
         let now = Instant::now();
         if now < due {
-            ctx.request_repaint_after(due - now);
+            // One frame per segment of the progress line, asked for at the exact
+            // moment that segment lights — not a frame rate. Four frames for the
+            // default four-second hold, against the hundred and twenty a smooth
+            // bar wanted, which were both juddery and the sort of unbroken
+            // stream `crate::idle` blames for a black-canvas flicker here.
+            let (filled, total) = self.slideshow_steps(due);
+            let hold = Duration::from_secs(u64::from(self.settings.slideshow_secs.max(1)));
+            let next = hold.mul_f64(f64::from(filled + 1) / f64::from(total));
+            let wake = (due - hold + next).saturating_duration_since(now);
+            ctx.request_repaint_after(wake.min(due - now).max(Duration::from_millis(16)));
             return;
         }
 
@@ -1628,6 +1658,47 @@ impl App {
         };
     }
 
+    /// Put the file's name in the window title, and so in the taskbar and
+    /// Alt-Tab.
+    ///
+    /// Until now the title was the app's name and nothing else, whatever was
+    /// open — which is fine while the window is in front of you and useless
+    /// everywhere Windows shows a window by its title instead.
+    ///
+    /// Only when it changes: the title is a viewport command, which crosses to
+    /// the windowing thread, and sending the same string sixty times a second
+    /// is work for nothing.
+    fn retitle(&mut self, ctx: &egui::Context) {
+        let title = match self.path.as_deref().and_then(|path| path.file_name()) {
+            Some(name) => format!("{} — Imaginer", name.to_string_lossy()),
+            // No path with an image is clipboard pixels; no path without one is
+            // the empty state. The status bar draws the same distinction.
+            None if self.texture.is_some() => "Unsaved image — Imaginer".to_owned(),
+            None => "Imaginer".to_owned(),
+        };
+
+        if self.title.as_deref() != Some(title.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = Some(title);
+        }
+    }
+
+    /// How many of the progress line's segments are lit, and how many there are.
+    ///
+    /// One place rather than two: the canvas draws from this and the repaint
+    /// schedule counts from it, and a disagreement between them would either
+    /// leave a segment unlit until the slide changed or ask for frames that
+    /// redraw the same picture.
+    fn slideshow_steps(&self, due: Instant) -> (u32, u32) {
+        let total = viewer::slideshow_segments(self.settings.slideshow_secs);
+        let hold = Duration::from_secs(u64::from(self.settings.slideshow_secs.max(1)));
+        let left = due.saturating_duration_since(Instant::now());
+        let spent = hold.saturating_sub(left).as_secs_f64();
+        let step = hold.as_secs_f64() / f64::from(total);
+        let filled = (spent / step).floor() as u32;
+        (filled.min(total), total)
+    }
+
     /// Advance the slideshow when its time is up, and keep frames coming until it is.
     fn tick_slideshow(&mut self, ctx: &egui::Context) {
         let Some(due) = self.slideshow else {
@@ -1779,6 +1850,7 @@ impl eframe::App for App {
                         &mut self.view,
                         toolbar::Bar {
                             has_image: self.texture.is_some(),
+                            zoom: self.last_zoom,
                             fullscreen: self.fullscreen,
                             slideshow: self.slideshow.is_some(),
                             has_neighbours,
@@ -1799,6 +1871,14 @@ impl eframe::App for App {
                             path: self.path.as_deref(),
                             texture: self.texture.as_ref(),
                             stage: self.stage,
+                            // Only once it has been long enough to be worth
+                            // saying, and only while there is nothing else to
+                            // look at — a preview already says the same thing
+                            // more usefully, by being a picture.
+                            decoding: self.stage.is_none()
+                                && self
+                                    .loading_since
+                                    .is_some_and(|since| since.elapsed() > DECODE_NOTICE),
                             zoom: self.last_zoom,
                             file_size: self.stamp.as_ref().map(Stamp::file_size),
                             position: self.folder.as_ref().and_then(Folder::position),
@@ -1946,6 +2026,35 @@ impl eframe::App for App {
                         None => {}
                     }
 
+                    // A file being dragged over the window, over everything
+                    // else on the canvas: while it is there, nothing else on
+                    // this surface is what the pointer is about to do.
+                    let hovering = ctx.input(|i| {
+                        i.raw
+                            .hovered_files
+                            .first()
+                            .map(|file| match file.path.as_deref() {
+                                Some(path) => path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                                None => String::new(),
+                            })
+                    });
+                    if let Some(name) = hovering {
+                        let name = (!name.is_empty()).then_some(name);
+                        viewer::drop_hint(ui, canvas, name.as_deref());
+                    }
+
+                    // How long this slide has left, along the foot of the canvas.
+                    // Above the chevrons and the playback bar in the paint
+                    // order, because it is three points tall and they are discs
+                    // that would swallow it.
+                    if let Some(due) = self.slideshow {
+                        let (filled, total) = self.slideshow_steps(due);
+                        viewer::slideshow_progress(ui, canvas, filled, total);
+                    }
+
                     // The playback bar belongs beside the chevrons: on the canvas,
                     // with the chrome. Cropping hides it along with everything else
                     // that acts on the image as a whole.
@@ -2010,6 +2119,8 @@ impl eframe::App for App {
         // what the canvas just drew. Resting rather than polling while an edit,
         // a crop or a decode is in flight: the picture on screen is then either
         // not the artwork's any more, or about to be replaced.
+        self.retitle(&ctx);
+
         let settled = !self.loading && self.edits.is_empty() && self.crop.is_none();
         match (settled, self.last_look, self.texture.as_mut()) {
             (true, Some(look), Some(texture)) => {

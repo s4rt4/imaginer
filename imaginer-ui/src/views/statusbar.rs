@@ -12,6 +12,8 @@ pub struct Status<'a> {
     pub path: Option<&'a Path>,
     pub texture: Option<&'a ImageTexture>,
     pub stage: Option<Stage>,
+    /// Whether a decode has been running long enough to be worth mentioning.
+    pub decoding: bool,
     pub zoom: f32,
     pub file_size: Option<u64>,
     /// Where this image sits in its folder, 1-based, as `(position, total)`.
@@ -73,6 +75,14 @@ fn facts(ui: &mut egui::Ui, status: &Status<'_>) {
             }
         }
 
+        // Before the early return below, not after it: the first image of a
+        // session has no texture yet, and that is the one time the canvas is
+        // empty and the wait is most obviously unexplained.
+        if status.decoding {
+            separator(ui);
+            ui.colored_label(theme::ACCENT_COLOR, "decoding…");
+        }
+
         let Some(texture) = status.texture else {
             return;
         };
@@ -95,6 +105,7 @@ fn facts(ui: &mut egui::Ui, status: &Status<'_>) {
             separator(ui);
             ui.colored_label(theme::ACCENT_COLOR, "preview…");
         }
+
 
         if texture.downscaled {
             separator(ui);

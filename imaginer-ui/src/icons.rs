@@ -90,7 +90,36 @@ pub fn paint(ui: &egui::Ui, icons: &mut Icons, icon: Icon, rect: egui::Rect, tin
 /// Chrome that is quiet until you reach for it is what lets a toolbar sit above a
 /// photograph without competing with it.
 pub fn button(ui: &mut egui::Ui, icons: &mut Icons, icon: Icon, tooltip: &str) -> egui::Response {
-    let (rect, response, visuals) = flat_button(ui, BUTTON_SIZE);
+    toggle(ui, icons, icon, tooltip, false)
+}
+
+/// The same button, drawn lit when `on`.
+///
+/// For the buttons that turn something on and leave it on — the slideshow, the
+/// sidebar, fullscreen. Without this they look identical running and stopped,
+/// so the only way to know whether the slideshow is going is to watch for the
+/// next picture. Lit is a filled backdrop in the accent, not a different icon:
+/// the icon says what the button does, and changing it would mean learning two
+/// glyphs for one action.
+pub fn toggle(
+    ui: &mut egui::Ui,
+    icons: &mut Icons,
+    icon: Icon,
+    tooltip: &str,
+    on: bool,
+) -> egui::Response {
+    let (rect, response, mut visuals) = flat_button(ui, BUTTON_SIZE);
+
+    if on {
+        ui.painter().rect_filled(
+            rect,
+            visuals.corner_radius,
+            crate::theme::ACCENT_COLOR.gamma_multiply(0.30),
+        );
+        // The icon takes the accent too, so a lit button reads at a glance
+        // rather than only under the pointer.
+        visuals.fg_stroke.color = crate::theme::ACCENT_COLOR;
+    }
 
     if ui.is_rect_visible(rect) {
         let icon_rect = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(DRAW_SIZE))

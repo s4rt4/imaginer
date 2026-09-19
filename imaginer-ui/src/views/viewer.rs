@@ -216,6 +216,128 @@ pub fn show(
     Shown { zoom, image_rect }
 }
 
+/// The logo's own two colours, read off `assets/imaginer_logoicon.svg`.
+///
+/// Not the theme's accent, which is a blue chosen to sit quietly behind
+/// photographs. This one line is the app signing its name, so it wears the
+/// logo — and it is the only place in the chrome that does.
+const LOGO_RED: egui::Color32 = egui::Color32::from_rgb(0xdc, 0x23, 0x3d);
+const LOGO_YELLOW: egui::Color32 = egui::Color32::from_rgb(0xf4, 0xcf, 0x48);
+
+/// How thick the slideshow's progress line is, in points.
+const PROGRESS_THICKNESS: f32 = 3.0;
+
+/// Gap between two segments of that line, in points.
+const PROGRESS_GAP: f32 = 2.0;
+
+/// Most segments the line is ever cut into.
+///
+/// A one-second segment is the natural unit — the hold is set in seconds — but a
+/// sixty-second slide would be sixty slivers on a bar a window wide, which reads
+/// as a dotted line rather than as a count. Past this the segments cover two
+/// seconds each, then three, and stay legible.
+const PROGRESS_MAX_SEGMENTS: u32 = 24;
+
+/// How many segments a hold of `seconds` is drawn as.
+///
+/// Public because the repaint schedule has to agree with the drawing: the app
+/// asks for exactly one frame per segment, so if these two disagreed the line
+/// would either sit stale or ask for frames nobody sees.
+pub fn slideshow_segments(seconds: u32) -> u32 {
+    seconds.clamp(1, PROGRESS_MAX_SEGMENTS)
+}
+
+/// A row of segments across the foot of the canvas, one lighting up per step.
+///
+/// **Deliberately not a sliding bar.** The first version filled continuously and
+/// asked for thirty frames a second to do it, which was both visibly juddery and
+/// exactly the "stream of back-to-back presents" that [`crate::idle`] records as
+/// the cause of a black-canvas flicker on this machine. Stepping needs one frame
+/// per segment — four frames for the default four-second hold — and a step that
+/// lands in one jump cannot judder, because there is nothing between one
+/// position and the next to be uneven about.
+///
+/// It also answers the two questions better than a smooth bar did: how long each
+/// photo holds is the number of segments, and how long is left is how many are
+/// still dark. A sliding bar only ever showed a proportion.
+///
+/// Drawn along the bottom edge rather than in the status bar because the status
+/// bar hides itself in fullscreen, which is exactly where a slideshow is watched.
+/// The colour runs from the logo's red to its yellow across the whole row, so a
+/// glance at the colour of the last lit segment says how far in this is.
+pub fn slideshow_progress(ui: &egui::Ui, canvas: egui::Rect, filled: u32, total: u32) {
+    if total == 0 || canvas.width() <= 0.0 {
+        return;
+    }
+
+    let painter = ui.painter_at(canvas);
+    let span = canvas.width() / total as f32;
+    let top = canvas.bottom() - PROGRESS_THICKNESS;
+
+    for segment in 0..filled.min(total) {
+        let left = canvas.left() + span * segment as f32;
+        // The gap comes off the right of each segment, so the row starts flush
+        // with the canvas edge and the last lit segment does not appear to float.
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(left, top),
+            egui::pos2(left + (span - PROGRESS_GAP).max(1.0), canvas.bottom()),
+        );
+        let through = if total > 1 {
+            segment as f32 / (total - 1) as f32
+        } else {
+            0.0
+        };
+        painter.rect_filled(rect, 0.0, lerp_colour(LOGO_RED, LOGO_YELLOW, through));
+    }
+}
+
+/// Mix two colours, `t` of the way from `from` to `to`.
+fn lerp_colour(from: egui::Color32, to: egui::Color32, t: f32) -> egui::Color32 {
+    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    egui::Color32::from_rgb(
+        mix(from.r(), to.r()),
+        mix(from.g(), to.g()),
+        mix(from.b(), to.b()),
+    )
+}
+
+/// Say that letting go here will open the file being dragged.
+///
+/// Dropping already worked; nothing said so. A window that takes a file but
+/// gives no sign it is willing to reads as a window that will not, so people
+/// drop onto the taskbar icon instead, or give up and use the Open dialog.
+///
+/// Drawn over the picture rather than replacing it, and only while something is
+/// actually hovering: the image stays visible underneath, which is what makes it
+/// obvious *which* window is about to take the file.
+pub fn drop_hint(ui: &egui::Ui, canvas: egui::Rect, name: Option<&str>) {
+    let painter = ui.painter_at(canvas);
+    painter.rect_filled(canvas, 0.0, egui::Color32::from_black_alpha(140));
+
+    let inset = canvas.shrink(10.0);
+    painter.rect_stroke(
+        inset,
+        6.0,
+        egui::Stroke::new(2.0, LOGO_YELLOW),
+        egui::StrokeKind::Inside,
+    );
+
+    // The file's own name when the shell gives us one, because a drag over a
+    // viewer is nearly always "is this the right file" rather than "will this
+    // work at all".
+    let text = match name {
+        Some(name) => format!("Drop to open {name}"),
+        None => "Drop to open".to_owned(),
+    };
+    painter.text(
+        canvas.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::TextStyle::Heading.resolve(ui.style()),
+        theme::TEXT_PRIMARY,
+    );
+}
+
 /// Which way a canvas chevron was asking to go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -389,6 +511,33 @@ mod tests {
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let hole = egui::Rect::from_min_size(egui::pos2(2000.0, 2000.0), egui::vec2(10.0, 10.0));
         assert_eq!(around(canvas, hole), vec![canvas]);
+    }
+
+    #[test]
+    fn a_hold_is_one_segment_per_second_until_that_stops_being_readable() {
+        assert_eq!(slideshow_segments(4), 4, "the default hold, a segment a second");
+        assert_eq!(slideshow_segments(1), 1);
+        assert_eq!(slideshow_segments(24), 24);
+        assert_eq!(
+            slideshow_segments(60),
+            PROGRESS_MAX_SEGMENTS,
+            "a minute is not sixty slivers"
+        );
+        // Zero would divide by itself in the drawing; the setting cannot be zero
+        // but the clamp is what makes that a fact rather than a hope.
+        assert_eq!(slideshow_segments(0), 1);
+    }
+
+    #[test]
+    fn the_progress_colour_runs_from_one_logo_colour_to_the_other() {
+        assert_eq!(lerp_colour(LOGO_RED, LOGO_YELLOW, 0.0), LOGO_RED);
+        assert_eq!(lerp_colour(LOGO_RED, LOGO_YELLOW, 1.0), LOGO_YELLOW);
+
+        // And halfway is between them on every channel, which is what makes the
+        // leading edge readable as "how far through the slide is this".
+        let middle = lerp_colour(LOGO_RED, LOGO_YELLOW, 0.5);
+        assert!(middle.r() > LOGO_RED.r() && middle.r() < LOGO_YELLOW.r());
+        assert!(middle.g() > LOGO_RED.g() && middle.g() < LOGO_YELLOW.g());
     }
 
     #[test]

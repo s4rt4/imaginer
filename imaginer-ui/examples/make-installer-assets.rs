@@ -187,8 +187,8 @@ fn paste(dst: &mut RgbaImage, src: &RgbaImage, at: (i64, i64)) {
                 continue;
             }
             let target = dst.get_pixel_mut(dx as u32, dy as u32);
-            for channel in 0..3 {
-                target.0[channel] = (f32::from(source[channel]) * alpha
+            for (channel, &over) in source.iter().take(3).enumerate() {
+                target.0[channel] = (f32::from(over) * alpha
                     + f32::from(target.0[channel]) * (1.0 - alpha))
                     .round() as u8;
             }

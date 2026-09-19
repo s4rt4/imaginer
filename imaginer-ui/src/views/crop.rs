@@ -227,6 +227,13 @@ fn paint(
         painter.hline(rect.x_range(), y, thirds);
     }
 
+    // The size in pixels, which is the number anyone cropping to a target is
+    // working towards and the one thing the overlay could not tell them. In
+    // image pixels, not screen points: a crop is a promise about the file, and
+    // the same selection at 50% zoom and at 200% would otherwise read as two
+    // different sizes.
+    size_readout(&painter, ui, rect, selection);
+
     for corner in [
         rect.left_top(),
         rect.right_top(),
@@ -239,6 +246,46 @@ fn paint(
             theme::TEXT_PRIMARY,
         );
     }
+}
+
+/// Draw `w × h` beside the selection, in image pixels.
+///
+/// Above the top-left corner, and inside the selection when there is no room
+/// above — a crop dragged to the top of the canvas should not push its own
+/// label off the screen.
+fn size_readout(
+    painter: &egui::Painter,
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    selection: egui::Rect,
+) {
+    const PAD: egui::Vec2 = egui::vec2(6.0, 3.0);
+    const MARGIN: f32 = 6.0;
+
+    let text = format!(
+        "{} × {}",
+        selection.width().round() as u32,
+        selection.height().round() as u32
+    );
+    let galley = painter.layout_no_wrap(
+        text,
+        egui::TextStyle::Small.resolve(ui.style()),
+        theme::TEXT_PRIMARY,
+    );
+
+    let size = galley.size() + PAD * 2.0;
+    let above = rect.top() - MARGIN - size.y;
+    let top_left = if above >= painter.clip_rect().top() {
+        egui::pos2(rect.left(), above)
+    } else {
+        egui::pos2(rect.left() + MARGIN, rect.top() + MARGIN)
+    };
+
+    // A backdrop, because this sits over a photograph and white text on a white
+    // sky is not a readout.
+    let panel = egui::Rect::from_min_size(top_left, size);
+    painter.rect_filled(panel, 3.0, egui::Color32::from_black_alpha(160));
+    painter.galley(panel.min + PAD, galley, theme::TEXT_PRIMARY);
 }
 
 fn bounds_of(image: (u32, u32)) -> egui::Rect {

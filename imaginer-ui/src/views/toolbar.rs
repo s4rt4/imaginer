@@ -31,6 +31,9 @@ pub enum Action {
 #[derive(Debug, Clone, Copy)]
 pub struct Bar {
     pub has_image: bool,
+    /// The zoom the canvas actually drew at last frame, which is what the
+    /// toolbar's zoom control reports.
+    pub zoom: f32,
     pub fullscreen: bool,
     pub slideshow: bool,
     /// Whether there is anywhere to step to, which is what makes a slideshow
@@ -91,10 +94,13 @@ pub fn show(
             if icons::button(ui, icons, Icon::FitScreen, "Fit to window (F)").clicked() {
                 view.reset();
             }
-            // Text, because "actual size" has no glyph anyone reads unambiguously.
-            if icons::text_button(ui, "100%", "Actual size (1)").clicked() {
-                view.set_zoom(1.0);
-            }
+            // The live zoom, and a menu of the ones worth a click. It used to be
+            // a button labelled "100%" that set the zoom to 100% — which sat two
+            // inches from a status bar reading "37%", so half the time it was
+            // read as a display of the current zoom rather than as a control.
+            // Showing the real number settles that, and the presets are what the
+            // button did plus the four anyone actually wants.
+            zoom_menu(ui, view, bar.zoom);
             // The icon shows what the button will do next, not which mode you are
             // in — a button that depicts the current state leaves you guessing what
             // pressing it does.
@@ -132,7 +138,12 @@ pub fn show(
             } else {
                 "File and EXIF info (I)"
             };
-            if icons::button(ui, icons, Icon::Info, tooltip).clicked() {
+            // Lit while its panel is up. Unlike fullscreen and the slideshow
+            // above, this button cannot say so by swapping its icon: there is no
+            // "close the info panel" glyph, and inventing one would be a second
+            // symbol to learn for one action. The three panel buttons light
+            // instead, which is the same answer to the same question.
+            if icons::toggle(ui, icons, Icon::Info, tooltip, bar.info_open).clicked() {
                 action = Some(Action::ToggleInfo);
             }
 
@@ -158,7 +169,7 @@ pub fn show(
             } else {
                 "Settings and shortcuts (S)"
             };
-            if icons::button(ui, icons, Icon::Setting, tooltip).clicked() {
+            if icons::toggle(ui, icons, Icon::Setting, tooltip, bar.settings_open).clicked() {
                 action = Some(Action::ToggleSettings);
             }
             ui.add_enabled_ui(bar.has_image, |ui| {
@@ -167,7 +178,7 @@ pub fn show(
                 } else {
                     "Edit this image (E)"
                 };
-                if icons::button(ui, icons, Icon::Edits, tooltip).clicked() {
+                if icons::toggle(ui, icons, Icon::Edits, tooltip, bar.sidebar_open).clicked() {
                     action = Some(Action::ToggleSidebar);
                 }
             });
@@ -184,6 +195,39 @@ pub fn show(
 /// shut after each would make that two trips. The listing re-sorts behind it as each
 /// is clicked, so the effect of a choice is visible while the next one is still
 /// under the pointer. Clicking away, or the button again, closes it.
+/// The current zoom, and the handful worth jumping straight to.
+///
+/// Percentages a viewer is asked for by name, rather than a continuous slider:
+/// zooming by degrees is what the wheel is for, and what a menu adds is the
+/// ability to land on a *number* — 100% to check focus, 400% to look at an edge,
+/// fit to see the whole thing again.
+fn zoom_menu(ui: &mut egui::Ui, view: &mut ViewState, zoom: f32) {
+    /// Beyond 400% the wheel is a better tool than a list, and below 25% there
+    /// is nothing to see that fit does not show.
+    const PRESETS: [f32; 5] = [0.25, 0.5, 1.0, 2.0, 4.0];
+
+    let label = format!("{:.0}%", zoom * 100.0);
+    let button = icons::text_button(ui, &label, "Zoom");
+    egui::Popup::menu(&button).show(|ui| {
+        if ui.selectable_label(false, "Fit to window").clicked() {
+            view.reset();
+        }
+        ui.separator();
+        for preset in PRESETS {
+            // Marked when the canvas is already there, within a hair: the zoom
+            // arrived at by wheel is never exactly 1.0, and a menu that never
+            // ticks anything is a menu that does not know what it is showing.
+            let here = (zoom - preset).abs() < 0.005;
+            if ui
+                .selectable_label(here, format!("{:.0}%", preset * 100.0))
+                .clicked()
+            {
+                view.set_zoom(preset);
+            }
+        }
+    });
+}
+
 fn sort_menu(ui: &mut egui::Ui, icons: &mut Icons, order: Order) -> Option<Order> {
     let mut chosen = None;
 
