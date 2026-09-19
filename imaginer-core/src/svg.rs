@@ -121,17 +121,49 @@ impl Svg {
         )
     }
 
+    /// Rasterise one rectangle of the artwork, in SVG units, at an exact scale.
+    ///
+    /// The deep-zoom path calls this. Past a certain magnification a whole-artwork
+    /// raster stops being possible — [`MAX_SIDE`] is there because the alternative
+    /// is gigabytes — but the *screen* never grows, so what a viewer actually needs
+    /// is the part it is showing, drawn at the resolution it is showing it. That is
+    /// this: the pixmap stays the size of a window however far in the user goes, and
+    /// the vector is re-drawn rather than magnified, which is the whole difference
+    /// between this and a PNG.
+    ///
+    /// `x` and `y` are the top-left of the wanted region in SVG units; `width` and
+    /// `height` are the output in pixels. Asking for a region that runs off the
+    /// artwork is allowed and comes back transparent there, which saves every caller
+    /// from clamping a rectangle it is about to clamp anyway.
+    pub fn render_region(
+        &self,
+        scale: f32,
+        x: f32,
+        y: f32,
+        width: u32,
+        height: u32,
+    ) -> Result<RgbaImage, SvgError> {
+        let transform =
+            tiny_skia::Transform::from_scale(scale, scale).post_translate(-x * scale, -y * scale);
+        self.draw_with(width, height, transform)
+    }
+
     fn draw(&self, width: u32, height: u32, scale: f32) -> Result<RgbaImage, SvgError> {
+        // One scale for both axes: the pixel dimensions are rounded, so deriving a
+        // separate y scale from them would stretch the artwork by up to half a pixel.
+        self.draw_with(width, height, tiny_skia::Transform::from_scale(scale, scale))
+    }
+
+    fn draw_with(
+        &self,
+        width: u32,
+        height: u32,
+        transform: tiny_skia::Transform,
+    ) -> Result<RgbaImage, SvgError> {
         let mut pixmap =
             tiny_skia::Pixmap::new(width, height).ok_or(SvgError::Size { width, height })?;
 
-        // One scale for both axes: the pixel dimensions are rounded, so deriving a
-        // separate y scale from them would stretch the artwork by up to half a pixel.
-        resvg::render(
-            &self.tree,
-            tiny_skia::Transform::from_scale(scale, scale),
-            &mut pixmap.as_mut(),
-        );
+        resvg::render(&self.tree, transform, &mut pixmap.as_mut());
 
         // tiny-skia composites in premultiplied alpha and `RgbaImage` is straight,
         // so this is not a copy that could be skipped.
@@ -224,6 +256,59 @@ mod tests {
             "alpha should be about half, got {}",
             pixel[3]
         );
+    }
+
+    /// Left half red, right half blue, in a 100x100 viewBox.
+    fn halves() -> &'static str {
+        concat!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" "#,
+            r#"viewBox="0 0 100 100">"#,
+            r#"<rect width="50" height="100" fill="red"/>"#,
+            r#"<rect x="50" width="50" height="100" fill="blue"/></svg>"#
+        )
+    }
+
+    #[test]
+    fn a_region_draws_only_that_part_of_the_artwork() {
+        let svg = Svg::parse(halves().as_bytes()).unwrap();
+
+        // The right half, at four pixels per unit: nothing but blue.
+        let right = svg.render_region(4.0, 50.0, 0.0, 200, 400).unwrap();
+        assert_eq!(right.dimensions(), (200, 400));
+        assert_eq!(right.get_pixel(0, 0).0, [0, 0, 255, 255]);
+        assert_eq!(right.get_pixel(199, 399).0, [0, 0, 255, 255]);
+
+        // And the left half is the other colour, at the same scale.
+        let left = svg.render_region(4.0, 0.0, 0.0, 200, 400).unwrap();
+        assert_eq!(left.get_pixel(199, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_region_is_the_same_picture_as_the_whole_one_at_that_scale() {
+        // The point of the deep-zoom path: what it draws has to line up with what
+        // the full raster would have drawn, or panning would shift the image.
+        let svg = Svg::parse(halves().as_bytes()).unwrap();
+        let whole = svg.render_longest(200).unwrap();
+        let patch = svg.render_region(2.0, 25.0, 25.0, 50, 50).unwrap();
+
+        for y in 0..50 {
+            for x in 0..50 {
+                assert_eq!(
+                    patch.get_pixel(x, y).0,
+                    whole.get_pixel(x + 50, y + 50).0,
+                    "patch pixel {x},{y} should match the whole render"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_region_past_the_edge_comes_back_transparent_rather_than_failing() {
+        let svg = Svg::parse(halves().as_bytes()).unwrap();
+        let over = svg.render_region(1.0, 90.0, 0.0, 20, 20).unwrap();
+
+        assert_eq!(over.get_pixel(0, 0).0[3], 255, "inside is still drawn");
+        assert_eq!(over.get_pixel(19, 0).0[3], 0, "past the edge is empty");
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::icons::{self, Icon, Icons};
 use crate::shader::AdjustShader;
 use crate::texture::ImageTexture;
 use crate::theme;
+use crate::vector;
 
 const MIN_ZOOM: f32 = 0.02;
 const MAX_ZOOM: f32 = 32.0;
@@ -89,6 +90,7 @@ pub fn show(
     interactive: bool,
     colour: Colour<'_>,
     checker: Option<&egui::TextureHandle>,
+    tile: Option<&vector::Tile>,
 ) -> Shown {
     let sense = if interactive {
         egui::Sense::click_and_drag()
@@ -173,18 +175,32 @@ pub fn show(
     // The shader is only worth reaching for when it has something to do, and it is
     // skipped entirely if it could not be built — on hardware that cannot compile
     // it, the adjustment still reaches the saved file, it just is not previewed.
-    if colour.adjust.is_none() || colour.shader.failed() {
-        painter.image(
-            texture.handle.id(),
-            image_rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
-    } else {
-        painter.add(
-            colour
-                .shader
-                .callback(rect, image_rect, texture.handle.id(), colour.adjust),
+    let draw = |into: egui::Rect, id: egui::TextureId| {
+        if colour.adjust.is_none() || colour.shader.failed() {
+            painter.image(
+                id,
+                into,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            painter.add(colour.shader.callback(rect, into, id, colour.adjust));
+        }
+    };
+
+    draw(image_rect, texture.handle.id());
+
+    // A vector patch, drawn over the part of the raster it improves on. Over
+    // rather than instead of: it covers what is on screen and no more, so the
+    // raster underneath is what fills the gap for the frames between a pan and
+    // the patch that catches up with it — and at these zooms that gap is the
+    // only thing standing between the user and a blank canvas.
+    if let Some(tile) = tile {
+        let region = tile.patch.region;
+        let at = |point: egui::Pos2| image_rect.min + point.to_vec2() * zoom;
+        draw(
+            egui::Rect::from_min_max(at(region.min), at(region.max)),
+            tile.texture.id(),
         );
     }
 

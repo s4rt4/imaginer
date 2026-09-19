@@ -16,6 +16,7 @@ mod startup;
 mod texture;
 mod theme;
 mod titlebar;
+mod vector;
 mod views;
 
 use std::path::PathBuf;
