@@ -199,6 +199,18 @@ fn destination_directory(request: &Request) -> Option<PathBuf> {
         return Some(dir.clone());
     }
 
+    // Said before the dialog opens, not after. Launched from Explorer nobody is
+    // reading this; typed at a prompt it is the difference between a command that
+    // is waiting for you and one that has hung, and the dialog can easily come up
+    // behind the terminal that started it.
+    //
+    // Flushed by hand, which is the whole point of it: Rust buffers stdout by
+    // block when it is not a terminal, so redirected to a file or a pipe this
+    // line would sit unwritten for exactly as long as the dialog blocks — which
+    // is precisely the stretch it exists to explain.
+    println!("Choose a destination folder for the converted file(s)...");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
     let mut dialog = rfd::FileDialog::new().set_title(format!(
         "Convert {} file{} to {} — choose a destination",
         request.files.len(),

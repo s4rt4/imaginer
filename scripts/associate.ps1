@@ -19,6 +19,14 @@
         which is what makes Imaginer appear under Settings > Apps > Default
         apps as a whole program, with a "Set default" button covering every
         listed type at once.
+      * An Applications\imaginer.exe entry, which is the key Windows writes by
+        itself the first time someone picks the exe through "Open with > choose
+        another app". Written here so it names the app properly and points at
+        the same copy as everything else above: left to Windows it has no
+        FriendlyAppName and shows up as a lowercase "imaginer", and if it was
+        recorded against a different copy of the exe than the ProgId — an
+        installed one against a dev build, say — Explorer lists the two
+        separately and the Open-with menu has Imaginer in it twice.
 
     Setting a default programmatically is deliberately not attempted: since
     Windows 10, HKCU\...\FileExts\<ext>\UserChoice is protected by a hash the
@@ -80,6 +88,7 @@ if ($Uninstall) {
     # array comma in PowerShell, and the concatenation this replaced produced
     # one space-joined string that matched no key at all.
     Remove-Item "$classesKey\$progId" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item "$classesKey\Applications\imaginer.exe" -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $appKey -Recurse -Force -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path 'HKCU:\Software\RegisteredApplications' -Name 'Imaginer' `
         -ErrorAction SilentlyContinue
@@ -110,6 +119,21 @@ foreach ($ext in $extensions) {
     # An empty-string value: OpenWithProgids entries are names, not data.
     New-ItemProperty "$classesKey\$ext\OpenWithProgids" -Name $progId `
         -Value '' -PropertyType String -Force | Out-Null
+}
+
+# The exe itself, under the name Windows looks it up by when someone browses to
+# it. One entry per file name rather than per path, which is exactly what makes
+# it the place to settle which copy of imaginer.exe is *the* one.
+$appsKey = "$classesKey\Applications\imaginer.exe"
+New-Item "$appsKey\shell\open\command" -Force | Out-Null
+Set-ItemProperty "$appsKey\shell\open\command" -Name '(default)' -Value "`"$Exe`" `"%1`""
+Set-ItemProperty $appsKey -Name 'FriendlyAppName' -Value 'Imaginer'
+# A subkey, one empty value per extension: without it Explorer offers the app for
+# every file on the disk, .exe and .dll included, which is how an image viewer
+# ends up in a menu it has no business in.
+New-Item "$appsKey\SupportedTypes" -Force | Out-Null
+foreach ($ext in $extensions) {
+    Set-ItemProperty "$appsKey\SupportedTypes" -Name $ext -Value ''
 }
 
 # The Default-apps entry: one "Set default" click covering every type.
