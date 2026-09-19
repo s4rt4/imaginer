@@ -14,7 +14,7 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 
 !define PRODUCT "Imaginer"
-!define VERSION "0.1.0"
+!define VERSION "0.2.0"
 !define EXE "imaginer.exe"
 !define UNKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT}"
 !define PROGID "Imaginer.AssocFile"

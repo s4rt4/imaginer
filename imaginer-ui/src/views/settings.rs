@@ -31,6 +31,8 @@ pub enum Action {
     CommitSlideshow,
     /// A sort choice was picked; applied and written down at once.
     SetOrder(Order),
+    /// Show what this is and what it can open.
+    OpenAbout,
 }
 
 /// Every binding the app answers to, as shown. Kept beside
@@ -81,11 +83,21 @@ pub fn show(ui: &mut egui::Ui, icons: &mut Icons, state: &mut State<'_>) -> Opti
                     }
                 });
             });
-            ui.label(
-                egui::RichText::new(concat!("Imaginer ", env!("CARGO_PKG_VERSION")))
-                    .weak()
-                    .small(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(concat!("Imaginer ", env!("CARGO_PKG_VERSION")))
+                        .weak()
+                        .small(),
+                );
+                // Beside the version rather than under the shortcuts, where it
+                // first went: that table is twenty rows and scrolls, so an about
+                // box down there is one nobody would find. Here it sits with the
+                // other thing on this panel that is about the app rather than
+                // about the picture.
+                if ui.small_button("About").clicked() {
+                    action = Some(Action::OpenAbout);
+                }
+            });
             ui.add_space(8.0);
 
             // The two halves together stand taller than the window: without the
@@ -98,6 +110,7 @@ pub fn show(ui: &mut egui::Ui, icons: &mut Icons, state: &mut State<'_>) -> Opti
                     }
                     ui.add_space(14.0);
                     shortcuts(ui);
+
                 });
         });
 

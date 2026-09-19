@@ -84,7 +84,7 @@ fn main() {
     .expect("writing imaginer.ico failed");
 
     // Header strip: the mark alone. The page beside it already says "Imaginer
-    // 0.1.0 Setup" in bold, so a wordmark here would be the app's name printed
+    // <version> Setup" in bold, so a wordmark here would be the app's name printed
     // twice, six pixels apart, at two different sizes — and squeezing one into
     // what is left of 150 points after the mark is what made it illegible.
     let mut header = solid(HEADER, HEADER_BG);

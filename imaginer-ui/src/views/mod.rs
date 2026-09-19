@@ -1,3 +1,4 @@
+pub mod about;
 pub mod crop;
 pub mod info;
 pub mod settings;

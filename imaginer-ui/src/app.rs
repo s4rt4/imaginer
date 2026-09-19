@@ -18,7 +18,7 @@ use crate::startup::StartupTrace;
 use crate::texture::{self, ImageTexture};
 use crate::vector;
 use crate::views::crop::CropState;
-use crate::views::{crop, info, settings, sidebar, statusbar, timeline, toolbar, viewer};
+use crate::views::{about, crop, info, settings, sidebar, statusbar, timeline, toolbar, viewer};
 use crate::{LoadMessage, clipboard, decode_into, theme, titlebar};
 
 /// How long a status-bar notice stays up. Long enough to read in passing, short
@@ -200,6 +200,9 @@ pub struct App {
     /// Uploaded the first time the empty state is drawn, so launching with an image
     /// never pays for it.
     logotype: Option<egui::TextureHandle>,
+    /// Whether the about box is up. Not a setting, so it is not persisted: a
+    /// session that opened it once has read it.
+    about_open: bool,
     /// The transparency backdrops, each uploaded the first time a picture with
     /// see-through pixels calls for it. Most sessions never ask for either.
     /// Checker for sampled images, diagonals for vector ones — which is a
@@ -296,6 +299,7 @@ impl App {
             clipboard_rx: std::sync::mpsc::channel().1,
             clipboard_busy: false,
             logotype: None,
+            about_open: false,
             checker: None,
             hatch: None,
             vector: vector::Zoom::default(),
@@ -1075,6 +1079,7 @@ impl App {
                     self.settings.slideshow_secs
                 ));
             }
+            settings::Action::OpenAbout => self.about_open = true,
             settings::Action::SetOrder(order) => {
                 // `set_order` re-sorts the listing, re-warms the prefetch and
                 // writes the settings file â€” everything a sort pick means.
@@ -1987,6 +1992,18 @@ impl eframe::App for App {
         }
         if let Some(action) = requested_timeline {
             self.apply_timeline(&ctx, action);
+        }
+
+        // Over everything, and after the panels that can open it. The logotype
+        // texture is the empty state's, uploaded on first use either way — an
+        // about box is not a reason to pay for it at startup.
+        if self.about_open {
+            let logotype = self
+                .logotype
+                .get_or_insert_with(|| logo::logotype_texture(&ctx));
+            if about::show(&ctx, logotype) {
+                self.about_open = false;
+            }
         }
 
         // After the canvas, because everything the vector path decides comes from
