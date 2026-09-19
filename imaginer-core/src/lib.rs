@@ -7,6 +7,7 @@
 pub use image;
 
 pub mod adjust;
+pub mod avif;
 pub mod cache;
 pub mod convert;
 pub mod decode;

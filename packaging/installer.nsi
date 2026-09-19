@@ -38,6 +38,7 @@ SetCompressor /SOLID lzma
   !insertmacro ${macro} ".svgz"
   !insertmacro ${macro} ".psd"
   !insertmacro ${macro} ".jxl"
+  !insertmacro ${macro} ".avif"
 !macroend
 
 !macro RegisterExtension ext

@@ -55,10 +55,13 @@ if (-not $Exe) {
 # .svg is the one worth having here above all: right-click a logo and get an .ico
 # or a WebP, which is the errand that sends people to an online converter.
 # .psd converts the flattened composite, which is what the app decodes.
+# .avif decodes via rav1d, and converting out of it is the useful direction:
+# nothing else on this machine opens one, and the web serves them.
 # .jxl decodes via jxl-oxide; conversion out of it is the useful direction,
 # since nothing this machine produces writes JPEG XL.
 $extensions = @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp',
-                '.tif', '.tiff', '.ico', '.ff', '.svg', '.svgz', '.psd', '.jxl')
+                '.tif', '.tiff', '.ico', '.ff', '.svg', '.svgz', '.psd', '.jxl',
+                '.avif')
 
 # What the submenu offers. The quality is fixed because a context menu has no room
 # for a slider: 90 is the CLI default and the point past which WebP and JPEG grow

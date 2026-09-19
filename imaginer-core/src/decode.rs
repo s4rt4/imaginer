@@ -30,7 +30,7 @@ use crate::metadata::{self, Orientation};
 /// not offering it.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "ff", "svg", "svgz", "psd",
-    "jxl",
+    "jxl", "avif",
 ];
 
 /// Whether `path` looks like something this build can open.
@@ -72,6 +72,12 @@ pub enum DecodeError {
         path: String,
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("could not decode {path}: {source}")]
+    Avif {
+        path: String,
+        #[source]
+        source: crate::avif::AvifError,
     },
 }
 
@@ -406,6 +412,20 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
         return decode_animation(&mut reader, format, orientation);
     }
 
+    // `image` recognises AVIF by its `ftyp` brand but was not built with a
+    // decoder for it — see the feature list in Cargo.toml — so asking it to
+    // decode would only produce "unsupported format". It goes to our own.
+    if probe.format() == Some(image::ImageFormat::Avif) {
+        let mut reader = probe.into_inner();
+        reader.rewind().map_err(io_err)?;
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).map_err(io_err)?;
+        return decode_avif(&data, orientation, |source| DecodeError::Avif {
+            path: path.display().to_string(),
+            source,
+        });
+    }
+
     let img = match probe.format() {
         Some(_) => probe.decode().map_err(img_err)?,
         // Nothing with a magic number. SVG is the only format here that has none â€”
@@ -685,6 +705,43 @@ fn decode_jxl<R: std::io::Read>(
 /// Decode a PSD file: the flattened composite Photoshop writes for
 /// compatibility, not the layers. See [`crate::psd`] for what that means and
 /// what is supported.
+/// AVIF, through the rav1d seam in [`crate::avif`].
+///
+/// Its own function rather than a branch inside the `image` path, because none of
+/// that path applies: `image` has no decoder for the format here, and the
+/// container carries its own rotation and mirror properties which `gamut-avif`
+/// has already applied by the time the pixels arrive.
+fn decode_avif(
+    data: &[u8],
+    orientation: Orientation,
+    avif_err: impl Fn(crate::avif::AvifError) -> DecodeError,
+) -> Result<Decoded, DecodeError> {
+    let img = crate::avif::decode(data).map_err(avif_err)?;
+
+    // AVIF can carry an Exif item, and an orientation read from it would be a
+    // second rotation on top of the container's `irot`/`imir` — which is why
+    // this applies what was read rather than assuming Normal, and why the two
+    // must not both be honoured. `metadata::read_orientation` finds no Exif in
+    // an AVIF today, so what arrives here is Normal and this is a no-op that
+    // keeps the path shaped like the others.
+    let img = orientation
+        .apply(image::DynamicImage::ImageRgba8(img))
+        .into_rgba8();
+    let full_size = (img.width(), img.height());
+    let pixels = Arc::new(img);
+    let has_transparency = has_transparency(&pixels);
+
+    Ok(Decoded {
+        pixels,
+        stage: Stage::Full,
+        orientation,
+        full_size,
+        animation: None,
+        has_transparency,
+        svg: None,
+    })
+}
+
 fn decode_psd<R: std::io::Read>(
     mut reader: R,
     orientation: Orientation,
