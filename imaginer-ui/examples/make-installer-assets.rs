@@ -1,16 +1,57 @@
 //! Generate the installer's image assets from the SVG sources of truth.
 //!
 //! NSIS needs three binaries this repo does not commit: the `.ico` on the
-//! installer and installed program, a 150x57 header strip and a 164x314
-//! welcome-panel image. All three are drawn here from `assets/` through
-//! `imaginer_core::Svg` and `export::write` — the same code path a user's own
-//! files take — so editing the artwork and re-running this example refreshes
-//! everything.
+//! installer and installed program, a header strip and a welcome-panel image.
+//! All three are drawn here from `assets/` through `imaginer_core::Svg` — the
+//! same code path a user's own files take — so editing the artwork and
+//! re-running this example refreshes everything.
 //!
 //! Run: `cargo run --release -p imaginer-ui --example make-installer-assets`
+//!
+//! Two things about the panels that are easy to get wrong, and were:
+//!
+//! **They are stretched, so they must be drawn big.** MUI2 defaults both
+//! bitmaps to `FitControl` — the image is scaled to whatever the control
+//! measures — and the control is sized in dialog units, which grow with the
+//! display's DPI. At 150% a 150x57 bitmap is blown up to 225x86 by the nearest
+//! thing to a nearest-neighbour blit, which is exactly as bad as it sounds. So
+//! everything here is drawn at [`SCALE`] times the recommended size, in the
+//! recommended *proportion*: stretching then lands somewhere between a mild
+//! downsample and no resampling at all.
+//!
+//! **Fitting is a box, not a scale.** The version of this file that shipped
+//! computed `canvas - art / 2` where it meant `(canvas - art) / 2`, in three
+//! places, which put the artwork half off the right edge of the panel and the
+//! wordmark half off the bottom of the header. Nothing here multiplies a
+//! measurement by hand any more: [`fit`] renders the vector into a box and
+//! [`centre_in`] places it.
 
-use imaginer_core::{ExportSettings, Format, Svg};
 use imaginer_core::image::{ImageFormat, Rgba, RgbaImage};
+use imaginer_core::{ExportSettings, Format, Svg};
+
+/// How many times the recommended size everything is drawn at.
+///
+/// Three covers a 300% display, which is past anything Windows offers as a
+/// standard scale. The cost is a megabyte or so of bitmap before compression,
+/// and these are flat colour behind line art — LZMA eats them.
+const SCALE: u32 = 3;
+
+/// Header strip, in the size MUI2 documents. Drawn at [`SCALE`] times this.
+const HEADER: (u32, u32) = (150, 57);
+/// Welcome and finish panel, likewise.
+const SIDEBAR: (u32, u32) = (164, 314);
+
+/// The app's own palette (`imaginer-ui/src/theme.rs`), restated here so the
+/// installer matches the chrome without imaginer-ui's eframe dependency.
+const BG_DEEPEST: [u8; 3] = [0x0e, 0x0f, 0x11];
+
+/// What the wizard's header actually is behind the bitmap.
+///
+/// White, because that is the colour Windows paints the strip the bitmap sits
+/// in. The panel colour from the app's theme was used here once and it read as
+/// a black slab dropped into a white band — the one place in this installer
+/// where matching the app's chrome is the wrong instinct.
+const HEADER_BG: [u8; 3] = [0xff, 0xff, 0xff];
 
 /// Repo layout the script is run from: `imaginer-ui/examples`.
 fn repo_root() -> std::path::PathBuf {
@@ -20,11 +61,6 @@ fn repo_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// The app's own palette (`imaginer-ui/src/theme.rs`), restated here so the
-/// installer matches the chrome without imaginer-ui's eframe dependency.
-const BG_DEEPEST: [u8; 3] = [0x0e, 0x0f, 0x11];
-const BG_PANEL: [u8; 3] = [0x16, 0x18, 0x1c];
-
 fn main() {
     let root = repo_root();
     let out = root.join("packaging");
@@ -33,13 +69,10 @@ fn main() {
     let icon = parse(&root.join("assets/imaginer_logoicon.svg"));
     let logotype = parse(&root.join("assets/imaginer_logotype.svg"));
 
-    let icon_art = icon.render_longest(512).expect("icon rasterises");
-    let wordmark = logotype.render_longest(512).expect("logotype rasterises");
-
     // The icon: rendered well past the ladder's top rung so every size in the
     // .ico is a clean downsample. `export::write` builds the whole ladder, PNG
     // at 256 and raw BMP below, exactly as the executable's own resource does.
-    let square = squarify(&icon_art);
+    let square = squarify(&icon.render_longest(512).expect("icon rasterises"));
     imaginer_core::export::write(
         &square,
         &out.join("imaginer.ico"),
@@ -50,30 +83,43 @@ fn main() {
     )
     .expect("writing imaginer.ico failed");
 
-    // Header strip: icon and wordmark on the panel colour, the same pair the
-    // app's toolbar shows.
-    let mut header = solid(150, 57, BG_PANEL);
-    let mark = fit_square(&icon_art, 44);
-    paste(&mut header, &mark, 6, 6);
-    let word = fit_height(&wordmark, 20);
-    paste(&mut header, &word, 58, 57 as i64 - word.height() as i64 / 2);
+    // Header strip: the mark alone. The page beside it already says "Imaginer
+    // 0.1.0 Setup" in bold, so a wordmark here would be the app's name printed
+    // twice, six pixels apart, at two different sizes — and squeezing one into
+    // what is left of 150 points after the mark is what made it illegible.
+    let mut header = solid(HEADER, HEADER_BG);
+    let mark = fit(&icon, (40, 40));
+    let at = centre_in(&header, &mark);
+    paste(&mut header, &mark, at);
     save_bmp(&header, &out.join("header.bmp"));
 
-    // Welcome panel: the artwork large on the deepest background, wordmark
-    // beneath — what NSIS scales to fill the left column of the wizard.
-    let mut sidebar = solid(164, 314, BG_DEEPEST);
-    let big = fit_square(&icon_art, 104);
-    paste(&mut sidebar, &big, 164 as i64 - big.width() as i64 / 2, 72);
-    let word = fit_height(&wordmark, 44);
-    paste(
-        &mut sidebar,
-        &word,
-        164 as i64 - word.width() as i64 / 2,
-        200,
-    );
+    // Welcome panel: the mark large over the wordmark, on the app's darkest
+    // background — this one is a panel of its own beside the wizard's text, not
+    // a patch inside a white band, and the dark is what makes it read as the
+    // app's rather than as Windows'.
+    let mut sidebar = solid(SIDEBAR, BG_DEEPEST);
+    let mark = fit(&icon, (96, 96));
+    let (mark_x, _) = centre_in(&sidebar, &mark);
+    paste(&mut sidebar, &mark, (mark_x, up(86)));
+
+    let word = fit(&logotype, (120, 34));
+    let (word_x, _) = centre_in(&sidebar, &word);
+    paste(&mut sidebar, &word, (word_x, up(206)));
     save_bmp(&sidebar, &out.join("sidebar.bmp"));
 
-    println!("wrote {}", out.display());
+    println!(
+        "wrote {} at {SCALE}x: header {}x{}, sidebar {}x{}",
+        out.display(),
+        HEADER.0 * SCALE,
+        HEADER.1 * SCALE,
+        SIDEBAR.0 * SCALE,
+        SIDEBAR.1 * SCALE
+    );
+}
+
+/// A measurement in the documented size, scaled up to what is actually drawn.
+fn up(measure: u32) -> i64 {
+    i64::from(measure * SCALE)
 }
 
 fn parse(path: &std::path::Path) -> Svg {
@@ -81,59 +127,72 @@ fn parse(path: &std::path::Path) -> Svg {
     Svg::parse(&data).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
 }
 
-/// Centre the artwork on a transparent square, so the icon's ladder entries
-/// are square even though the source is only assumed to be roughly so.
+/// Render `art` as large as it goes inside `box_size` without being cropped or
+/// stretched, at [`SCALE`].
+///
+/// From the vector each time rather than resampling one big raster: the whole
+/// reason the artwork is SVG is that there is an exactly-right rasterisation
+/// for every size, and reaching for it costs a millisecond.
+fn fit(art: &Svg, box_size: (u32, u32)) -> RgbaImage {
+    let (box_width, box_height) = (box_size.0 * SCALE, box_size.1 * SCALE);
+    let (width, height) = art.size();
+    // Whichever side runs out first decides, which is what stops a wide
+    // wordmark from being sized by its height and running off the panel.
+    let scale = (box_width as f32 / width).min(box_height as f32 / height);
+    let longest = (width.max(height) * scale).round().max(1.0) as u32;
+    art.render_longest(longest)
+        .expect("artwork rasterises at a size that fits a panel")
+}
+
+/// Where to paste `art` so it sits in the middle of `canvas`.
+///
+/// `(canvas - art) / 2`. Spelled out once, here, because the same expression
+/// written by hand at three call sites is where this file's cropping came from.
+fn centre_in(canvas: &RgbaImage, art: &RgbaImage) -> (i64, i64) {
+    (
+        (i64::from(canvas.width()) - i64::from(art.width())) / 2,
+        (i64::from(canvas.height()) - i64::from(art.height())) / 2,
+    )
+}
+
+/// Centre the artwork on a transparent square, so the icon's ladder entries are
+/// square even though the source is only assumed to be roughly so.
 fn squarify(art: &RgbaImage) -> RgbaImage {
     let side = art.width().max(art.height());
     let mut out = RgbaImage::new(side, side);
-    let x = (side - art.width()) / 2;
-    let y = (side - art.height()) / 2;
-    paste(&mut out, art, x as i64, y as i64);
+    let at = centre_in(&out, art);
+    paste(&mut out, art, at);
     out
 }
 
-/// Nearest-neighbour fit inside a square, preserving aspect with transparent
-/// margins. Downsampling by integer-ish factors is fine at these sizes.
-fn fit_square(art: &RgbaImage, side: u32) -> RgbaImage {
-    let scale = side as f32 / art.width().max(art.height()) as f32;
-    let w = ((art.width() as f32 * scale).round() as u32).max(1);
-    let h = ((art.height() as f32 * scale).round() as u32).max(1);
-    squarify(&resize(art, w, h))
-}
-
-fn fit_height(art: &RgbaImage, height: u32) -> RgbaImage {
-    let scale = height as f32 / art.height() as f32;
-    let w = ((art.width() as f32 * scale).round() as u32).max(1);
-    resize(art, w, height)
-}
-
-fn resize(art: &RgbaImage, w: u32, h: u32) -> RgbaImage {
-    imaginer_core::image::imageops::resize(art, w, h, imaginer_core::image::imageops::FilterType::Lanczos3)
-}
-
-fn solid(width: u32, height: u32, rgb: [u8; 3]) -> RgbaImage {
-    RgbaImage::from_pixel(width, height, Rgba([rgb[0], rgb[1], rgb[2], 255]))
+fn solid(size: (u32, u32), rgb: [u8; 3]) -> RgbaImage {
+    RgbaImage::from_pixel(
+        size.0 * SCALE,
+        size.1 * SCALE,
+        Rgba([rgb[0], rgb[1], rgb[2], 255]),
+    )
 }
 
 /// Alpha-composite `src` onto `dst`, clipping whatever falls outside.
-fn paste(dst: &mut RgbaImage, src: &RgbaImage, x: i64, y: i64) {
+fn paste(dst: &mut RgbaImage, src: &RgbaImage, at: (i64, i64)) {
     for sy in 0..src.height() as i64 {
         for sx in 0..src.width() as i64 {
-            let (dx, dy) = (x + sx, y + sy);
+            let (dx, dy) = (at.0 + sx, at.1 + sy);
             if dx < 0 || dy < 0 || dx >= dst.width() as i64 || dy >= dst.height() as i64 {
                 continue;
             }
-            let a = src.get_pixel(sx as u32, sy as u32).0[3] as f32 / 255.0;
-            if a == 0.0 {
+            let source = src.get_pixel(sx as u32, sy as u32).0;
+            let alpha = f32::from(source[3]) / 255.0;
+            if alpha == 0.0 {
                 continue;
             }
-            let d = dst.get_pixel_mut(dx as u32, dy as u32);
-            for c in 0..3 {
-                d.0[c] = (src.get_pixel(sx as u32, sy as u32).0[c] as f32 * a
-                    + d.0[c] as f32 * (1.0 - a))
+            let target = dst.get_pixel_mut(dx as u32, dy as u32);
+            for channel in 0..3 {
+                target.0[channel] = (f32::from(source[channel]) * alpha
+                    + f32::from(target.0[channel]) * (1.0 - alpha))
                     .round() as u8;
             }
-            d.0[3] = 255;
+            target.0[3] = 255;
         }
     }
 }
