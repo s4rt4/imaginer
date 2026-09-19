@@ -172,6 +172,13 @@ impl Zoom {
         self.stalled = false;
     }
 
+    /// Whether the picture on screen was drawn from a description rather than
+    /// sampled — which is a thing the viewer shows the user, not only something
+    /// this module acts on.
+    pub fn is_vector(&self) -> bool {
+        self.svg.is_some()
+    }
+
     /// The patch to draw over the image, if there is one.
     pub fn tile(&self) -> Option<&Tile> {
         self.tile.as_ref()

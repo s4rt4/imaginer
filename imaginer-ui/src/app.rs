@@ -200,9 +200,13 @@ pub struct App {
     /// Uploaded the first time the empty state is drawn, so launching with an image
     /// never pays for it.
     logotype: Option<egui::TextureHandle>,
-    /// The transparency checker, uploaded the first time a picture with
-    /// see-through pixels is shown. Most sessions never ask for it.
-    checker: Option<egui::TextureHandle>,
+    /// The transparency backdrops, each uploaded the first time a picture with
+    /// see-through pixels calls for it. Most sessions never ask for either.
+    /// Checker for sampled images, diagonals for vector ones — which is a
+    /// glance's worth of "what am I looking at" for free, since a picture with
+    /// no transparency needs neither.
+    checker: Option<texture::Backdrop>,
+    hatch: Option<texture::Backdrop>,
     /// The vector artwork behind the image on screen, when it is an SVG, and the
     /// re-renders that keep it sharp as the view moves. Inert for every other
     /// format; `Decoded.svg` is what wakes it up.
@@ -293,6 +297,7 @@ impl App {
             clipboard_busy: false,
             logotype: None,
             checker: None,
+            hatch: None,
             vector: vector::Zoom::default(),
             last_look: None,
             icons: Icons::default(),
@@ -1895,10 +1900,15 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 if let Some(texture) = self.texture.as_ref() {
                     let canvas = ui.max_rect();
-                    if texture.has_transparency {
-                        self.checker
-                            .get_or_insert_with(|| texture::checkerboard(&ctx));
-                    }
+                    let backdrop = texture.has_transparency.then(|| {
+                        if self.vector.is_vector() {
+                            &*self.hatch.get_or_insert_with(|| texture::diagonals(&ctx))
+                        } else {
+                            &*self
+                                .checker
+                                .get_or_insert_with(|| texture::checkerboard(&ctx))
+                        }
+                    });
                     let shown = viewer::show(
                         ui,
                         texture,
@@ -1908,7 +1918,7 @@ impl eframe::App for App {
                             adjust: self.adjust,
                             shader: &self.shader,
                         },
-                        self.checker.as_ref(),
+                        backdrop,
                         self.vector.tile(),
                     );
                     self.last_zoom = shown.zoom;

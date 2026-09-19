@@ -5,7 +5,7 @@ use imaginer_core::Adjust;
 
 use crate::icons::{self, Icon, Icons};
 use crate::shader::AdjustShader;
-use crate::texture::ImageTexture;
+use crate::texture::{Backdrop, ImageTexture};
 use crate::theme;
 use crate::vector;
 
@@ -89,7 +89,7 @@ pub fn show(
     state: &mut ViewState,
     interactive: bool,
     colour: Colour<'_>,
-    checker: Option<&egui::TextureHandle>,
+    backdrop: Option<&Backdrop>,
     tile: Option<&vector::Tile>,
 ) -> Shown {
     let sense = if interactive {
@@ -160,12 +160,11 @@ pub fn show(
     // picture is panned or zoomed — Photoshop's behaviour, not a pattern baked
     // into the image that would zoom with it.
     if texture.has_transparency
-        && let Some(checker) = checker
+        && let Some(backdrop) = backdrop
     {
-        const SQUARE: f32 = 8.0;
-        let uv_max = image_rect.size() / (2.0 * SQUARE);
+        let uv_max = image_rect.size() / backdrop.period;
         painter.image(
-            checker.id(),
+            backdrop.handle.id(),
             image_rect,
             egui::Rect::from_min_size(egui::Pos2::ZERO, uv_max),
             egui::Color32::WHITE,
