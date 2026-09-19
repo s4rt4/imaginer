@@ -14,7 +14,7 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 
 !define PRODUCT "Imaginer"
-!define VERSION "0.2.0"
+!define VERSION "0.2.1"
 !define EXE "imaginer.exe"
 !define UNKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT}"
 !define PROGID "Imaginer.AssocFile"
@@ -77,8 +77,38 @@ RequestExecutionLevel admin
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 
+; Read the previous install location from the view the writes below use.
+;
+; `InstallDirRegKey` cannot be told a registry view, and NSIS is a 32-bit
+; process, so it reads the 32-bit one — which is where versions up to 0.2.0 put
+; everything by accident. Both are consulted: the 64-bit value if this has
+; installed since the fix, the 32-bit one if it has not.
+Function .onInit
+  SetRegView 64
+  ReadRegStr $0 HKLM "Software\${PRODUCT}" "InstallDir"
+  StrCmp $0 "" +2 0
+  StrCpy $INSTDIR $0
+FunctionEnd
+
 Section "Install"
   SetShellVarContext all
+
+  ; Everything below goes in the 64-bit view, because this is a 64-bit program
+  ; installed under $PROGRAMFILES64. Without this NSIS, being 32-bit, is
+  ; redirected into WOW6432Node — and versions up to 0.2.0 were: the Default
+  ; apps entry pointed `RegisteredApplications\Imaginer` at a Capabilities key
+  ; that, read by 64-bit Windows, was not there. The file associations survived
+  ; that only because HKLM\SOFTWARE\Classes is shared between the two views
+  ; rather than redirected, which is what kept the fault invisible.
+  SetRegView 64
+
+  ; The 32-bit copies an earlier installer left. Removed before anything is
+  ; written, so an upgrade does not end up listed twice in Apps & Features.
+  SetRegView 32
+  DeleteRegKey HKLM "${UNKEY}"
+  DeleteRegKey HKLM "Software\${PRODUCT}"
+  DeleteRegValue HKLM "Software\RegisteredApplications" "${PRODUCT}"
+  SetRegView 64
 
   ; An image still open in the previous install would hold the exe and fail
   ; the copy; killing it is safe whether or not it is running.
@@ -135,6 +165,7 @@ SectionEnd
 
 Section "un.Install"
   SetShellVarContext all
+  SetRegView 64
   nsExec::Exec 'taskkill /IM ${EXE} /F'
   Pop $0
   Sleep 300
@@ -156,5 +187,14 @@ Section "un.Install"
   DeleteRegKey HKLM "Software\Classes\${PROGID}"
   DeleteRegKey HKLM "${APPKEY}"
   DeleteRegValue HKLM "Software\RegisteredApplications" "${PRODUCT}"
+
+  ; And whatever a pre-fix installer left in the other view, so uninstalling
+  ; really does leave nothing behind.
+  SetRegView 32
+  DeleteRegKey HKLM "${UNKEY}"
+  DeleteRegKey HKLM "Software\${PRODUCT}"
+  DeleteRegValue HKLM "Software\RegisteredApplications" "${PRODUCT}"
+  SetRegView 64
+
   System::Call 'shell32::SHChangeNotify(i 0x8000000, i 0, i 0, i 0)'
 SectionEnd
