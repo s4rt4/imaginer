@@ -51,7 +51,8 @@ quotes in `git commit -m` get mangled — use `git commit -F <file>`.
 - **Cargo features are compile-time**; "load on first use" was wrong. Dependency count
   affects compile time/binary size, not startup. `imageproc` not needed unless
   convolution filters are wanted.
-- **AVIF is expensive** (dav1d FFI, same tier as HEIC), unlike TIFF/ICO.
+- **AVIF is decoded, in Rust** — that verdict flipped on 2026-09-19, see the section
+  below. HEIC still is expensive; the two are no longer the same tier.
 - **Rotate exists once**, in the edit sidebar (turns the image, savable). View-only
   rotate dropped; `R` maps to it.
 - **Convert and scale are export settings** (Save panel), not transform tools.
@@ -115,6 +116,7 @@ decode (`5f44fe7`); SVG open via resvg, logo through the same code (`d701827`);
 animated GIF/WebP playback + timeline scrub (see animation notes below);
 SVG sharpen-on-zoom + settings panel scroll (`11938ac`, resolves bug.md 2026-08-26);
 JXL decode via jxl-oxide (sample in Downloads drives an `#[ignore]` test);
+AVIF decode via gamut-avif + rav1d (see below);
 NSIS installer (`packaging/installer.nsi` + `examples/make-installer-assets.rs`);
 version shown in the settings panel and in the exe's version resource.
 
@@ -302,10 +304,13 @@ catalog, plugins.
   decodes as zero. Photoshop itself writes RLE by default, but "rare" is not
   "never" for a wrong colour. Tests synthesise whole PSD files, RLE included.
   Layers/blend modes are a compositor's job and deliberately not attempted.
-- **AVIF — rejected, measured.** `avif-native` builds dav1d from C and wants
-  pkg-config + a system library (or nasm + meson). The build fails on this
-  machine without C toolchain setup no personal viewer should need. Extension
-  stays off SUPPORTED_EXTENSIONS — the list is a promise.
+- **AVIF — DONE 2026-09-19, and the 2026-08-26 rejection below is why it took a
+  second look.** That rejection was right about `avif-native`: it builds dav1d
+  from C and wants pkg-config + a system library (or nasm + meson), and the
+  build fails on this machine. What it missed is that dav1d has been
+  transliterated into Rust. `rav1d` with `default-features = false` builds from
+  `cargo build` alone — 40s cold, no nasm, no C compiler. See the AVIF section
+  below for what it cost.
 - **RAW (CR2/NEF/ARW/DNG) — deferred with a reason.** rawloader/rawler return
   undeveloped CFA data; a viewable image needs a develop pipeline (white
   balance, demosaic, camera matrix, gamma) — a DSP project of its own — and
@@ -314,6 +319,49 @@ catalog, plugins.
 - **HEIC — deferred with a reason.** No pure-Rust decoder; libheif FFI needs a
   system library, same cost tier as AVIF's dav1d, for a format this machine
   never produces.
+## AVIF (landed 2026-09-19)
+
+- **Two crates, because an AVIF is two problems.** `gamut-avif` reads the HEIF
+  container in safe Rust — items, the alpha auxiliary, `clap`/`irot`/`imir` — and
+  hands the coded picture to a decoder the caller supplies. `rav1d` is that
+  decoder. The seam between them is `core/avif.rs`, and it is the whole cost:
+  rav1d exposes no safe API, only dav1d's C shape, so ~90 lines of the file are
+  unsafe glue around `dav1d_open`/`send_data`/`get_picture`/`picture_unref`.
+- **Ten-bit is the common case, not an edge case.** ravif — and so most of what
+  encodes AVIF — codes even 8-bit input at 10 bits, because AV1 does it better.
+  `gamut-avif`'s RGBA surface takes 8-bit planes only, so the planes are brought
+  down in the plane copy, rounded rather than shifted (a plain shift darkens
+  every sample by up to half a level). Everything downstream is `RgbaImage`, so
+  nothing is lost that had anywhere to go. **Without this, most real AVIF fails**
+  with "«>8-bit RGBA presentation is not yet supported".
+- **Threads are capped at 4**, not `n_threads = 0`. The prefetcher decodes
+  neighbours at the same time; three contexts each taking every core is worse
+  than one taking four. With worker threads `get_picture` answers EAGAIN until
+  the frame is ready, so there is a drain loop with a 20s deadline — a still is
+  one frame, and a decode thread that spun forever would be a hung viewer.
+- **Measured here, release, 4-core cap:** 32x32 ~1ms; 3840x2160 with an alpha
+  item ~350ms (rav1d ~200ms across both items, colour pipeline ~140ms, plane copy
+  ~20ms). Single-threaded the same 4K frame is 1262ms. Binary grew 10.82MB →
+  12.24MB (+1.4MB). No SIMD, because SIMD means nasm at build time; that trade is
+  the point.
+- **Startup is unchanged**, A/B'd in one sitting against the commit before it
+  (a worktree at `e4311ef`, both binaries measured interleaved, 10 runs each):
+  `first_image` 1331ms before, 1332ms and 1354ms after, against a 40-80ms spread
+  inside a single batch. The extra 1.4MB buys nothing at startup and rav1d has no
+  pre-main work — which is what the "dependency count affects compile time and
+  binary size, not startup" note above already predicted.
+- **Fixtures are ours.** `core/tests/data/opaque32.avif` (8-bit wedge) and
+  `alpha64.avif` (10-bit, alpha cone) were generated with `ravif` in a throwaway
+  crate, not lifted from someone's test corpus. The alpha test asserts the *shape*
+  of the ramp, because a plane read at the wrong stride still gives a plausible
+  single value.
+- **Encoding AVIF is not done and is a separate question.** `gamut-avif` can
+  encode, but 8-bit RGB only — no alpha — so it is not yet a `Format` the export
+  and Convert paths could honestly offer.
+- Not attempted: animated AVIF (`avis`), HDR/wide gamut past the 8-bit
+  conversion, and Exif orientation inside an AVIF (the container's own transforms
+  are applied by `gamut-avif`; honouring both would rotate twice).
+
 ## Verification recipes
 
 - Startup: `scripts/bench-startup.ps1` (milestones to stderr); GPU pref:
@@ -324,3 +372,10 @@ catalog, plugins.
   adjust_costs` (24MP: 47ms brightness+contrast table, 387ms w/ saturation).
 - Clipboard round-trip test: `cargo test -p imaginer-ui -- --ignored`.
 - Shell integration: `scripts/install-shell-integration.ps1` (has `-Uninstall`).
+- Decoding a format end to end, without a window and without a screenshot:
+  `target/release/imaginer.exe --convert png --out <dir> <file>` runs the real
+  binary's decode path and writes something you can open. How AVIF was checked.
+- Open-with / Default-apps registration: `scripts\associate.ps1` (has
+  `-Uninstall`). The extension list lives in **four** places that must move
+  together — `SUPPORTED_EXTENSIONS`, that script, `install-shell-integration.ps1`,
+  and `packaging/installer.nsi`.
