@@ -693,16 +693,7 @@ impl App {
 
         let now = Instant::now();
         if now < due {
-            // One frame per segment of the progress line, asked for at the exact
-            // moment that segment lights — not a frame rate. Four frames for the
-            // default four-second hold, against the hundred and twenty a smooth
-            // bar wanted, which were both juddery and the sort of unbroken
-            // stream `crate::idle` blames for a black-canvas flicker here.
-            let (filled, total) = self.slideshow_steps(due);
-            let hold = Duration::from_secs(u64::from(self.settings.slideshow_secs.max(1)));
-            let next = hold.mul_f64(f64::from(filled + 1) / f64::from(total));
-            let wake = (due - hold + next).saturating_duration_since(now);
-            ctx.request_repaint_after(wake.min(due - now).max(Duration::from_millis(16)));
+            ctx.request_repaint_after(due - now);
             return;
         }
 
@@ -1690,13 +1681,7 @@ impl App {
     /// leave a segment unlit until the slide changed or ask for frames that
     /// redraw the same picture.
     fn slideshow_steps(&self, due: Instant) -> (u32, u32) {
-        let total = viewer::slideshow_segments(self.settings.slideshow_secs);
-        let hold = Duration::from_secs(u64::from(self.settings.slideshow_secs.max(1)));
-        let left = due.saturating_duration_since(Instant::now());
-        let spent = hold.saturating_sub(left).as_secs_f64();
-        let step = hold.as_secs_f64() / f64::from(total);
-        let filled = (spent / step).floor() as u32;
-        (filled.min(total), total)
+        slideshow_steps(self.settings.slideshow_secs, due, Instant::now())
     }
 
     /// Advance the slideshow when its time is up, and keep frames coming until it is.
@@ -1707,7 +1692,20 @@ impl App {
 
         let now = Instant::now();
         if now < due {
-            ctx.request_repaint_after(due - now);
+            // One frame per segment of the progress line, asked for at the
+            // moment that segment lights — not a frame rate. Four frames for the
+            // default four-second hold, where a smoothly sliding bar wanted a
+            // hundred and twenty and got them unevenly.
+            //
+            // Without this the only repaint asked for is the one at `due`, so
+            // the line is drawn once, a moment before the picture changes, and
+            // whatever else happens to cause a frame — a decode landing, the
+            // pointer moving — decides what it looks like the rest of the time.
+            ctx.request_repaint_after(slideshow_wake(
+                self.settings.slideshow_secs,
+                due,
+                now,
+            ));
             return;
         }
 
@@ -2204,6 +2202,48 @@ fn empty_state(ui: &mut egui::Ui, logotype: &egui::TextureHandle, error: Option<
 /// to put it in yet and the default is the number that matters. Anything unparseable
 /// falls back to the default rather than failing: a typo in a variable is no reason
 /// to refuse to open a photograph.
+/// How many of the progress line's segments are lit, and how many there are.
+///
+/// Takes `now` rather than reading the clock, so the sequence it produces over
+/// one hold can be asserted. That sequence *is* the indicator's behaviour, and
+/// while this read the clock there was no way to test it — which is how a
+/// version that only ever drew one frame per slide shipped.
+fn slideshow_steps(secs: u32, due: Instant, now: Instant) -> (u32, u32) {
+    let total = viewer::slideshow_segments(secs);
+    let hold = Duration::from_secs(u64::from(secs.max(1)));
+    let spent = hold.saturating_sub(due.saturating_duration_since(now));
+    let elapsed = (spent.as_secs_f64() / step_of(hold, total)).floor() as u32;
+
+    // The segment being *lived through* counts as lit, so the first is on from
+    // the moment the picture appears and the last is on for the second before it
+    // changes. Counting only whole segments left the line at three of four for
+    // the entire final second, and a progress indicator that never fills reads
+    // as one that is broken.
+    ((elapsed + 1).min(total), total)
+}
+
+/// How long until the next segment lights.
+///
+/// Clamped to the slide's own end, so the last wake is the one that changes the
+/// picture, and floored at a frame so a rounding error cannot ask for a repaint
+/// in no time at all and spin the loop.
+fn slideshow_wake(secs: u32, due: Instant, now: Instant) -> Duration {
+    let (lit, total) = slideshow_steps(secs, due, now);
+    let hold = Duration::from_secs(u64::from(secs.max(1)));
+    // `lit` counts the segment in progress, so the next boundary is at its end.
+    let next = Duration::from_secs_f64(step_of(hold, total) * f64::from(lit));
+
+    ((due - hold) + next)
+        .saturating_duration_since(now)
+        .min(due.saturating_duration_since(now))
+        .max(Duration::from_millis(16))
+}
+
+/// One segment's share of the hold.
+fn step_of(hold: Duration, total: u32) -> f64 {
+    hold.as_secs_f64() / f64::from(total.max(1))
+}
+
 fn cache_budget() -> usize {
     std::env::var("IMAGINER_CACHE_MB")
         .ok()
@@ -2224,5 +2264,78 @@ fn export_defaults(path: Option<&Path>) -> imaginer_core::ExportSettings {
             .and_then(imaginer_core::Format::from_path)
             .unwrap_or(imaginer_core::Format::Png),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One whole slide, segment by segment.
+    ///
+    /// The indicator's entire behaviour is this sequence: what is lit at each
+    /// moment, and when the next frame is asked for. It went untested while the
+    /// arithmetic read the clock, and what shipped in that gap was a version
+    /// whose scheduling had been applied to `tick_animation` instead — so the
+    /// slideshow asked for exactly one frame per slide and the line appeared as
+    /// a flicker just before the picture changed.
+    #[test]
+    fn a_four_second_hold_lights_a_segment_a_second_and_wakes_for_each() {
+        let start = Instant::now();
+        let due = start + Duration::from_secs(4);
+
+        for (after_ms, lit, wake_ms) in [
+            // Lit from the first instant: the picture is up, so its first second
+            // is being spent.
+            (0, 1, 1000),
+            (500, 1, 500),
+            (1000, 2, 1000),
+            (1500, 2, 500),
+            (2000, 3, 1000),
+            // Full for the last second, which is the cue that the next picture
+            // is about to arrive.
+            (3000, 4, 1000),
+            (3900, 4, 100),
+        ] {
+            let now = start + Duration::from_millis(after_ms);
+            let (filled, total) = slideshow_steps(4, due, now);
+            assert_eq!(total, 4, "four seconds, four segments");
+            assert_eq!(filled, lit, "at {after_ms}ms");
+
+            let wake = slideshow_wake(4, due, now).as_millis() as i64;
+            assert!(
+                (wake - wake_ms).abs() <= 2,
+                "at {after_ms}ms the next frame should be in about {wake_ms}ms, asked for {wake}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wake_never_asks_for_a_frame_in_no_time() {
+        // Exactly on a boundary, and a hair past the end: both are places the
+        // arithmetic can produce zero, and a zero-length repaint request is a
+        // spin rather than a schedule.
+        let start = Instant::now();
+        let due = start + Duration::from_secs(4);
+        for at in [1000, 2000, 3999, 4000, 5000] {
+            let wake = slideshow_wake(4, due, start + Duration::from_millis(at));
+            assert!(wake >= Duration::from_millis(16), "at {at}ms: {wake:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_hold_is_grouped_rather_than_shredded() {
+        // Sixty segments on a bar a window wide reads as a dotted line, so the
+        // segments cover more than a second each and the wake follows them.
+        let start = Instant::now();
+        let due = start + Duration::from_secs(60);
+        let (_, total) = slideshow_steps(60, due, start);
+        assert_eq!(total, 24);
+
+        let wake = slideshow_wake(60, due, start);
+        assert!(
+            wake > Duration::from_secs(2) && wake < Duration::from_secs(3),
+            "a sixtieth of a minute grouped into 24 is 2.5s a segment, got {wake:?}"
+        );
     }
 }
