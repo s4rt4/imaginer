@@ -175,7 +175,10 @@ pub fn show(
     // The shader is only worth reaching for when it has something to do, and it is
     // skipped entirely if it could not be built — on hardware that cannot compile
     // it, the adjustment still reaches the saved file, it just is not previewed.
-    let draw = |into: egui::Rect, id: egui::TextureId| {
+    // Taking the painter rather than closing over one: the bands around a vector
+    // patch are each drawn through their own clipped painter, and that is the same
+    // draw in every other respect.
+    let draw = |painter: &egui::Painter, into: egui::Rect, id: egui::TextureId| {
         if colour.adjust.is_none() || colour.shader.failed() {
             painter.image(
                 id,
@@ -188,20 +191,27 @@ pub fn show(
         }
     };
 
-    draw(image_rect, texture.handle.id());
+    // A vector patch replaces the raster over the part it covers, rather than
+    // being laid on top of it. It has to: an SVG has transparent pixels, and at
+    // these zooms the raster's antialiased edge is a row of half-see-through
+    // blocks the size of a thumbnail. Drawn underneath, that edge would show
+    // straight through the patch's transparency as a staircase ghost around
+    // every sharp one. So the raster is drawn in the bands *around* the patch —
+    // which is also what covers the gap between a pan and the patch catching up
+    // with it, and is nothing at all once the patch covers the window.
+    match tile {
+        None => draw(&painter, image_rect, texture.handle.id()),
+        Some(tile) => {
+            let region = tile.patch.region;
+            let at = |point: egui::Pos2| image_rect.min + point.to_vec2() * zoom;
+            let patch_rect = egui::Rect::from_min_max(at(region.min), at(region.max));
 
-    // A vector patch, drawn over the part of the raster it improves on. Over
-    // rather than instead of: it covers what is on screen and no more, so the
-    // raster underneath is what fills the gap for the frames between a pan and
-    // the patch that catches up with it — and at these zooms that gap is the
-    // only thing standing between the user and a blank canvas.
-    if let Some(tile) = tile {
-        let region = tile.patch.region;
-        let at = |point: egui::Pos2| image_rect.min + point.to_vec2() * zoom;
-        draw(
-            egui::Rect::from_min_max(at(region.min), at(region.max)),
-            tile.texture.id(),
-        );
+            for band in around(rect, patch_rect) {
+                draw(&ui.painter_at(band), image_rect, texture.handle.id());
+            }
+
+            draw(&painter, patch_rect, tile.texture.id());
+        }
     }
 
     Shown { zoom, image_rect }
@@ -289,6 +299,35 @@ pub fn chevrons(
     step
 }
 
+/// The parts of `outer` that `hole` does not cover, as up to four rectangles.
+///
+/// Empty when the hole covers everything, which is the common case while looking
+/// at a vector patch and is what stops the raster being drawn at all.
+fn around(outer: egui::Rect, hole: egui::Rect) -> Vec<egui::Rect> {
+    let hole = hole.intersect(outer);
+    if hole.width() <= 0.0 || hole.height() <= 0.0 {
+        return vec![outer];
+    }
+
+    let bands = [
+        egui::Rect::from_min_max(outer.min, egui::pos2(outer.right(), hole.top())),
+        egui::Rect::from_min_max(egui::pos2(outer.left(), hole.bottom()), outer.max),
+        egui::Rect::from_min_max(
+            egui::pos2(outer.left(), hole.top()),
+            egui::pos2(hole.left(), hole.bottom()),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(hole.right(), hole.top()),
+            egui::pos2(outer.right(), hole.bottom()),
+        ),
+    ];
+
+    bands
+        .into_iter()
+        .filter(|band| band.width() > 0.0 && band.height() > 0.0)
+        .collect()
+}
+
 /// Keep at least a sliver of the image on screen.
 fn clamp_offset(offset: egui::Vec2, displayed: egui::Vec2, canvas: egui::Vec2) -> egui::Vec2 {
     let limit = (displayed + canvas) * 0.5 - egui::Vec2::splat(PAN_KEEP_VISIBLE);
@@ -310,6 +349,47 @@ mod tests {
 
         let limit = (200.0 + 400.0) / 2.0 - PAN_KEEP_VISIBLE;
         assert_eq!(clamped, egui::vec2(limit, -limit));
+    }
+
+    #[test]
+    fn a_patch_covering_the_window_leaves_no_raster_to_draw() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        assert!(around(canvas, canvas.expand(50.0)).is_empty());
+    }
+
+    #[test]
+    fn a_patch_in_the_middle_leaves_four_bands_that_tile_the_rest() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let hole = egui::Rect::from_min_size(egui::pos2(200.0, 100.0), egui::vec2(300.0, 300.0));
+        let bands = around(canvas, hole);
+
+        assert_eq!(bands.len(), 4);
+        let area: f32 = bands.iter().map(|b| b.width() * b.height()).sum();
+        assert_eq!(
+            area,
+            canvas.width() * canvas.height() - hole.width() * hole.height(),
+            "the bands should cover exactly what the patch does not"
+        );
+        for band in &bands {
+            assert!(
+                band.intersect(hole).width() <= 0.0 || band.intersect(hole).height() <= 0.0,
+                "no band may overlap the patch: {band:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_spanning_one_whole_side_leaves_a_single_band() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let hole = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 600.0));
+        assert_eq!(around(canvas, hole).len(), 1, "only the strip to its right");
+    }
+
+    #[test]
+    fn a_patch_nowhere_near_the_canvas_leaves_it_whole() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let hole = egui::Rect::from_min_size(egui::pos2(2000.0, 2000.0), egui::vec2(10.0, 10.0));
+        assert_eq!(around(canvas, hole), vec![canvas]);
     }
 
     #[test]

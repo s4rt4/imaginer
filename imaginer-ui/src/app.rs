@@ -403,8 +403,10 @@ impl App {
         self.playing_before_scrub = false;
 
         // A vector artwork belongs to its file, and so does the raster
-        // resolution it was last drawn at.
+        // resolution it was last drawn at — and the geometry the canvas last
+        // reported, which described the picture being replaced.
         self.vector.clear();
+        self.last_look = None;
 
         // The EXIF block describes the file it came out of, so it goes with it. Not
         // read here: the panel is usually shut, and opening a file a second time to
@@ -522,7 +524,6 @@ impl App {
         let stage = decoded.stage;
         let animation = decoded.animation.clone();
         let svg = decoded.svg.clone();
-        let decoded_size = decoded.size();
         self.stage = Some(stage);
         self.texture = Some(texture::upload(ctx, &name, &decoded));
         self.error = None;
@@ -568,9 +569,15 @@ impl App {
         }
 
         // A vector file hands over its parsed artwork along with the first
-        // rasterisation of it; everything else has nothing to re-render.
-        let (width, height) = decoded_size;
-        self.vector.adopt(svg, width.max(height));
+        // rasterisation of it; everything else has nothing to re-render. The
+        // side recorded is what reached the GPU, not what was rasterised: a
+        // machine whose texture limit is below the render size gets the smaller
+        // number, which is the one the sharpen threshold has to measure against.
+        let uploaded = self
+            .texture
+            .as_ref()
+            .map_or((0, 0), |texture| texture.uploaded_size);
+        self.vector.adopt(svg, uploaded.0.max(uploaded.1));
     }
 
     fn poll_decode(&mut self, ctx: &egui::Context) {
@@ -1982,6 +1989,12 @@ impl eframe::App for App {
                 self.vector
                     .poll(&ctx, texture, &mut self.texture_generation, look)
             }
+            // Settled, but with no geometry to reason from yet: the canvas has
+            // not drawn this image once. That is the frame a step to a cached
+            // file lands on, and resting here would throw away the raster size
+            // `adopt` recorded moments ago and buy a re-render of pixels that
+            // are already on screen. Nothing to do but wait for the next frame.
+            (true, _, _) => {}
             _ => self.vector.rest(),
         }
 

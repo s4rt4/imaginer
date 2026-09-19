@@ -69,7 +69,7 @@ pub struct Tile {
 }
 
 /// What the canvas did this frame, which is all the geometry this needs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
     /// Where the whole image landed on screen, in points.
     pub image_rect: egui::Rect,
@@ -79,6 +79,19 @@ pub struct Look {
     pub zoom: f32,
     /// Physical pixels per point.
     pub ppp: f32,
+}
+
+/// Everything a request is decided from, worked out once per frame.
+struct View {
+    /// The image's native size, in source pixels.
+    source: egui::Vec2,
+    /// Screen pixels per source pixel.
+    scale: f32,
+    /// The largest patch this machine will take, per side.
+    cap: f32,
+    look: Look,
+    /// Whether the view is the same as it was last frame.
+    steady: bool,
 }
 
 /// The vector behind the picture on screen, and the re-renders it is feeding.
@@ -94,6 +107,24 @@ pub struct Zoom {
     whole_rx: Option<Receiver<Result<RgbaImage, String>>>,
     patch_rx: Option<Receiver<Result<(RgbaImage, Patch), String>>>,
     tile: Option<Tile>,
+    /// Set when a render came back an error, which stands the whole path down
+    /// until another file arrives. Nothing about a failure changes what the next
+    /// frame would ask for, so without this a rasteriser that cannot allocate
+    /// its pixmap is asked again — and handed a fresh thread — sixty times a
+    /// second, for as long as the picture is on screen.
+    stalled: bool,
+    /// The largest whole-artwork render already asked for.
+    ///
+    /// Not the same question as `side`, and the difference is what stops a loop:
+    /// `side` is what reached the GPU, which on a driver whose texture limit is
+    /// below [`svg::MAX_SIDE`] is *smaller* than what was drawn. Measuring the
+    /// threshold against that is right — those are the texels being magnified —
+    /// but asking again for a size already drawn would rasterise 67MB, watch it
+    /// be scaled down to the same texture, and do it again forever.
+    asked: u32,
+    /// The geometry the previous frame reported, so a view still being moved can
+    /// be told from one that has come to rest.
+    previous: Option<Look>,
 }
 
 impl Zoom {
@@ -112,6 +143,9 @@ impl Zoom {
         self.whole_rx = None;
         self.patch_rx = None;
         self.tile = None;
+        self.stalled = false;
+        self.asked = 0;
+        self.previous = None;
     }
 
     /// Stand down without forgetting the artwork.
@@ -125,6 +159,17 @@ impl Zoom {
         self.whole_rx = None;
         self.patch_rx = None;
         self.tile = None;
+        // And the raster resolution with them. Whatever is on the canvas during
+        // an edit is the edit's output, and when the edit is undone the pipeline
+        // re-uploads from the original pixels — so the sharp raster this had
+        // recorded is gone, and remembering it would leave the artwork stuck
+        // blurry with nothing to re-trigger a render.
+        self.side = 0;
+        self.asked = 0;
+        // An edit is also the natural place to give a failed render another go:
+        // whatever could not be allocated a minute ago may well fit now, and one
+        // retry per edit is not a storm.
+        self.stalled = false;
     }
 
     /// The patch to draw over the image, if there is one.
@@ -150,6 +195,12 @@ impl Zoom {
 
         self.collect_whole(ctx, texture, generation, trace);
         self.collect_patch(ctx, generation, trace);
+        if self.stalled {
+            // A render failed. What is up stays up — it is still the right
+            // picture, just not as sharp as it could be — but nothing more is
+            // asked for until a different file arrives.
+            return;
+        }
 
         let source = texture.source_vec();
         if source.x <= 0.0 || source.y <= 0.0 {
@@ -157,6 +208,25 @@ impl Zoom {
         }
         let scale = look.zoom * look.ppp;
         let needed = source.max_elem() * scale;
+
+        // A view that moved between this frame and the last is still moving, and
+        // a patch takes long enough to draw that one started now would be stale
+        // before it landed — a core burned per frame of a drag for pixels nobody
+        // ever sees. The exception is having no patch at all: something sharp is
+        // worth starting even mid-gesture, because until it arrives the screen
+        // is magnified raster.
+        let steady = self.previous == Some(look);
+        self.previous = Some(look);
+        // Ours is the smaller ceiling on any machine worth running this on, but
+        // a patch goes to the GPU without passing through the downscale that
+        // `texture::upload` does, so the driver's limit has to be honoured here.
+        let view = View {
+            source,
+            scale,
+            cap: PATCH_CAP.min(ctx.input(|i| i.max_texture_side) as f32),
+            look,
+            steady,
+        };
 
         if needed <= svg::MAX_SIDE as f32 {
             // A whole-artwork raster still reaches this far, and it is the better
@@ -171,7 +241,7 @@ impl Zoom {
             // Past the ceiling. The patch comes first — it is what the user is
             // actually looking at — and the whole raster is only topped up to its
             // maximum afterwards, as the backdrop a patch is laid over.
-            let started = self.request_patch(&svg, source, scale, look, trace);
+            let started = self.request_patch(&svg, &view, trace);
             if !started {
                 self.request_whole(&svg, needed, trace);
             }
@@ -205,7 +275,12 @@ impl Zoom {
                 let name = format!("image-{generation}");
                 *texture = texture::upload_pixels(ctx, &name, &pixels);
                 texture.source_size = source_size;
-                self.side = pixels.width().max(pixels.height());
+                // What reached the GPU, which `upload_pixels` will have scaled
+                // down if the driver's texture limit is below what was drawn.
+                // Recording the rasterised size instead would have the sharpen
+                // threshold measure against texels that are not there, and the
+                // artwork would sit blurry with nothing able to trigger a render.
+                self.side = texture.uploaded_size.0.max(texture.uploaded_size.1);
                 if trace {
                     eprintln!("svg: sharpened raster in, side={}", self.side);
                 }
@@ -217,6 +292,7 @@ impl Zoom {
                     eprintln!("svg: raster failed: {err}");
                 }
                 self.whole_rx = None;
+                self.stalled = true;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => self.whole_rx = None,
@@ -254,6 +330,7 @@ impl Zoom {
                     eprintln!("svg: patch failed: {err}");
                 }
                 self.patch_rx = None;
+                self.stalled = true;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => self.patch_rx = None,
@@ -269,6 +346,13 @@ impl Zoom {
         if needed <= self.side as f32 * SHARPEN_FACTOR || target <= self.side {
             return;
         }
+        if target <= self.asked {
+            // Already drawn at this size. The texture being smaller than that
+            // means the driver would not take it, which drawing it again will
+            // not change.
+            return;
+        }
+        self.asked = target;
         if trace {
             eprintln!(
                 "svg: raster side={} needs {needed:.0}px, asking for {target}",
@@ -285,40 +369,25 @@ impl Zoom {
     ///
     /// Returns whether a render was started, which is the caller's cue that the
     /// worker is busy with the thing that matters more.
-    fn request_patch(
-        &mut self,
-        svg: &Arc<Svg>,
-        source: egui::Vec2,
-        scale: f32,
-        look: Look,
-        trace: bool,
-    ) -> bool {
+    fn request_patch(&mut self, svg: &Arc<Svg>, view: &View, trace: bool) -> bool {
         if self.patch_rx.is_some() {
             return true;
         }
-        let Some(visible) = visible_region(look, source) else {
+        if !view.steady && self.tile.is_some() {
+            return false;
+        }
+        let Some(visible) = visible_region(view.look, view.source) else {
             return false;
         };
-        let want = plan(source, visible, scale, PATCH_CAP);
-        let (width, height) = pixel_size(want);
+        let exact = plan(view.source, visible, view.scale, view.cap);
+        let (width, height) = pixel_size(exact);
         if width == 0 || height == 0 {
             return false;
         }
 
-        // What will be drawn, to the pixel: the rounding above decides the region
-        // as much as the request did, and a region that disagreed with its own
-        // pixels by half of one would drift the patch against the image under it.
-        let exact = Patch {
-            region: egui::Rect::from_min_size(
-                want.region.min,
-                egui::vec2(width as f32, height as f32) / want.scale,
-            ),
-            scale: want.scale,
-        };
-
         if let Some(tile) = self.tile.as_ref()
             && tile.patch.scale >= exact.scale * 0.99
-            && tile.patch.region.contains_rect(visible)
+            && covers(tile.patch, visible)
         {
             // The patch up is both sharp enough and wide enough. This is the
             // ordinary case while the user looks around inside one view, and it
@@ -329,7 +398,7 @@ impl Zoom {
         // Source pixels are what the canvas thinks in; the artwork thinks in its
         // own units, and the first raster fixed the ratio between them.
         let (units_x, _) = svg.size();
-        let per_pixel = units_x / source.x.max(1.0);
+        let per_pixel = units_x / view.source.x.max(1.0);
         let draw_scale = exact.scale / per_pixel.max(f32::MIN_POSITIVE);
         let (x, y) = (
             exact.region.min.x * per_pixel,
@@ -348,7 +417,10 @@ impl Zoom {
                 .map(|pixels| (pixels, exact))
                 .map_err(|err| err.to_string())
         });
-        true
+        // Only if the thread is real. A machine that cannot spawn one has not
+        // started the render that matters more, so say so and let the caller
+        // fall back to topping up the whole-artwork raster instead.
+        self.patch_rx.is_some()
     }
 }
 
@@ -428,7 +500,36 @@ fn plan(source: egui::Vec2, visible: egui::Rect, scale: f32, cap: f32) -> Patch 
         }
     }
 
-    Patch { region, scale }
+    // Settle on whole pixels here, and let the region follow them rather than the
+    // other way round. A region rounded to fewer pixels than it covers is one the
+    // freshness check below would find too small for the screen *every* frame,
+    // which is a render storm rather than a blurry edge.
+    //
+    // Rounding up, except where that would reach past the artwork: pixels drawn
+    // off the edge come back transparent, so they cost time to produce nothing.
+    // What that shaves off is a fraction of one pixel at one edge, which is what
+    // the slack in `covers` is for.
+    let room = (whole.max - region.min) * scale;
+    let pixels = (region.size() * scale)
+        .ceil()
+        .min(egui::Vec2::splat(cap))
+        .min(egui::vec2(room.x.floor(), room.y.floor()));
+    Patch {
+        region: egui::Rect::from_min_size(region.min, pixels / scale),
+        scale,
+    }
+}
+
+/// Whether a patch still covers what the screen is showing.
+///
+/// With a screen pixel of slack: the cap above can shave a fraction off a patch
+/// that is otherwise exactly right, and re-rendering the whole thing over half a
+/// pixel at one edge is a worse answer than the half pixel.
+fn covers(patch: Patch, visible: egui::Rect) -> bool {
+    patch
+        .region
+        .expand(1.0 / patch.scale.max(f32::MIN_POSITIVE))
+        .contains_rect(visible)
 }
 
 /// How far a rectangle of `size` centred at `centre` has to move to sit inside
@@ -441,6 +542,7 @@ fn nudge_inside(centre: egui::Pos2, size: egui::Vec2, whole: egui::Rect) -> egui
     )
 }
 
+/// How many pixels a patch is, which [`plan`] has already made a whole number.
 fn pixel_size(patch: Patch) -> (u32, u32) {
     let pixels = patch.region.size() * patch.scale;
     (
@@ -502,13 +604,25 @@ mod tests {
     #[test]
     fn a_patch_never_reaches_outside_the_artwork() {
         // Hard against the bottom-right corner: expanding by the margin would
-        // run off the image, and rendering empty space is wasted pixels.
-        let visible = rect(974.0, 974.0, 50.0, 50.0);
-        let patch = plan(SOURCE, visible, 10.0, 8192.0);
+        // run off the image, and rendering empty space is wasted pixels. The
+        // scale is deliberately one that does not divide the region evenly, so
+        // rounding up to whole pixels is the thing pushing at the edge.
+        let visible = rect(971.0, 971.0, 50.0, 50.0);
+        let patch = plan(SOURCE, visible, 7.3, 8192.0);
 
         let whole = egui::Rect::from_min_size(egui::Pos2::ZERO, SOURCE);
         assert!(whole.contains_rect(patch.region), "{:?}", patch.region);
-        assert!(patch.region.contains_rect(visible));
+        assert!(covers(patch, visible), "{:?}", patch.region);
+
+        // A whole number of pixels, to within the float round-trip through
+        // `pixels / scale` and back — which is what keeps the rendered patch and
+        // the region describing it from disagreeing enough to matter.
+        let pixels = patch.region.size() * patch.scale;
+        assert!(
+            (pixels.x - pixels.x.round()).abs() < 0.01
+                && (pixels.y - pixels.y.round()).abs() < 0.01,
+            "a patch should be whole pixels, got {pixels:?}"
+        );
     }
 
     #[test]
@@ -544,6 +658,131 @@ mod tests {
         r#"<rect width="50" height="100" fill="red"/>"#,
         r#"<rect x="50" width="50" height="100" fill="blue"/></svg>"#
     );
+
+    /// Settle whatever renders are in flight, with a bound so a hang is a
+    /// failure rather than a test that never finishes.
+    fn settle(zoom: &mut Zoom, ctx: &egui::Context, texture: &mut ImageTexture, look: Look) {
+        // Generous, because these run in a debug build where a multi-megapixel
+        // rasterise is seconds rather than milliseconds.
+        let mut generation = 0;
+        for _ in 0..1500 {
+            zoom.poll(ctx, texture, &mut generation, look);
+            if zoom.whole_rx.is_none() && zoom.patch_rx.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("renders never finished");
+    }
+
+    /// A driver that will not take the texture must not be asked twice.
+    ///
+    /// `upload_pixels` scales a render down to the texture limit, so on such a
+    /// machine the raster on screen is permanently smaller than what was drawn.
+    /// The sharpen threshold measures against the smaller number — correctly,
+    /// those are the texels being magnified — which means without a memory of
+    /// what has already been drawn it asks for the larger one again, forever.
+    #[test]
+    fn a_render_the_gpu_shrinks_is_not_asked_for_again() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                max_texture_side: Some(1024),
+                ..Default::default()
+            },
+            |_| {},
+        );
+
+        let svg = Arc::new(Svg::parse(HALVES.as_bytes()).unwrap());
+        let pixels = svg.render_longest(2048).unwrap();
+        let mut texture = texture::upload_pixels(&ctx, "test", &pixels);
+        assert_eq!(texture.uploaded_size, (1024, 1024), "the driver shrank it");
+
+        let mut zoom = Zoom::default();
+        zoom.adopt(
+            Some(Arc::clone(&svg)),
+            texture.uploaded_size.0.max(texture.uploaded_size.1),
+        );
+
+        // Enough zoom to want more texels than the driver took, and not enough
+        // to leave the whole-artwork path for patches.
+        let side = pixels.width() as f32;
+        let look = Look {
+            image_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(side)),
+            canvas: rect(0.0, 0.0, 800.0, 600.0),
+            zoom: 1.0,
+            ppp: 1.0,
+        };
+
+        settle(&mut zoom, &ctx, &mut texture, look);
+        let asked_once = zoom.asked;
+        assert!(asked_once > 0, "it should have tried once");
+        assert_eq!(zoom.side, 1024, "and got the driver's answer back");
+
+        let mut generation = 0;
+        for _ in 0..5 {
+            zoom.poll(&ctx, &mut texture, &mut generation, look);
+            assert!(
+                zoom.whole_rx.is_none(),
+                "the same render must not be started again"
+            );
+        }
+        assert_eq!(zoom.asked, asked_once, "and nothing new was asked for");
+    }
+
+    /// A view still being dragged should not have renders started under it.
+    #[test]
+    fn a_moving_view_waits_but_a_first_patch_does_not() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+
+        let svg = Arc::new(Svg::parse(HALVES.as_bytes()).unwrap());
+        let pixels = svg.render_fit().unwrap();
+        let side = pixels.width().max(pixels.height());
+        let mut texture = texture::upload_pixels(&ctx, "test", &pixels);
+        let mut zoom = Zoom::default();
+        zoom.adopt(Some(Arc::clone(&svg)), side);
+
+        let at = |offset: f32| Look {
+            image_rect: egui::Rect::from_min_size(
+                egui::pos2(-5000.0 + offset, -5000.0),
+                egui::Vec2::splat(side as f32 * 20.0),
+            ),
+            canvas: rect(0.0, 0.0, 800.0, 600.0),
+            zoom: 20.0,
+            ppp: 1.0,
+        };
+
+        // Nothing on screen yet, so the first patch starts even though this is
+        // the first frame at this geometry and nothing is steady.
+        let mut generation = 0;
+        for _ in 0..300 {
+            zoom.poll(&ctx, &mut texture, &mut generation, at(0.0));
+            if zoom.tile().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(zoom.tile().is_some(), "a first patch should have been drawn");
+
+        // Now drag: every frame a different view, none of them repeated.
+        for step in 1..6 {
+            zoom.poll(&ctx, &mut texture, &mut generation, at(step as f32 * 400.0));
+            assert!(
+                zoom.patch_rx.is_none(),
+                "a patch was started under a view still moving"
+            );
+        }
+
+        // And on the frame the drag stops, the same view twice, it starts.
+        let rested = at(2400.0);
+        zoom.poll(&ctx, &mut texture, &mut generation, rested);
+        zoom.poll(&ctx, &mut texture, &mut generation, rested);
+        assert!(
+            zoom.patch_rx.is_some() || zoom.tile().is_some(),
+            "a view at rest should get its patch"
+        );
+    }
 
     /// The whole path, without a window: threshold, request, worker, arrival.
     ///
