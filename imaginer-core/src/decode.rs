@@ -437,20 +437,41 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
             let mut reader = probe.into_inner();
             reader.rewind().map_err(io_err)?;
 
-            // PSD and JPEG XL both have magic numbers, but `image` knows neither
-            // format â€” check for them before the SVG fallback claims the file.
-            let mut magic = [0u8; 12];
-            reader.read_exact(&mut magic).map_err(io_err)?;
-            reader.rewind().map_err(io_err)?;
-            if magic[0..4] == *b"8BPS" {
-                return decode_psd(reader, orientation);
-            }
-            if magic[0..2] == [0xFF, 0x0A] || magic == JXL_CONTAINER_SIGNATURE {
-                return decode_jxl(reader, orientation, jxl_err);
-            }
-
+            // PSD, JPEG XL and AVIF all have magic numbers, but `image` knows
+            // none of the three: check for them before the SVG fallback claims
+            // the file. Read whole rather than peeked, because an AVIF's brands
+            // run past any fixed-size sniff and the SVG path below wants the
+            // bytes anyway.
             let mut data = Vec::new();
             reader.read_to_end(&mut data).map_err(io_err)?;
+
+            if data.starts_with(b"8BPS") {
+                return decode_psd(&data[..], orientation);
+            }
+            if data.starts_with(&[0xFF, 0x0A])
+                || data.get(..12) == Some(&JXL_CONTAINER_SIGNATURE[..])
+            {
+                return decode_jxl(&data[..], orientation, jxl_err);
+            }
+            // Reached whenever the major brand is not `avif`. `mif1` is a common
+            // one and `image` recognises only the first, so this is where most
+            // AVIF in the wild actually arrives.
+            if crate::avif::is_avif(&data) {
+                return decode_avif(&data, orientation, |source| DecodeError::Avif {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+            if crate::avif::is_iso_media(&data) {
+                // HEIC, MP4 and the rest. Naming what it is beats letting the
+                // SVG parser answer for a file that was never text.
+                return Err(DecodeError::Avif {
+                    path: path.display().to_string(),
+                    source: crate::avif::AvifError::Container(
+                        "an ISO media file, but not AVIF. HEIC and HEIF are not supported".into(),
+                    ),
+                });
+            }
 
             let svg = crate::svg::Svg::parse(&data).map_err(svg_err)?;
             let rendered = svg.render_fit().map_err(svg_err)?;

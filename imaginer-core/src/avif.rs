@@ -66,6 +66,50 @@ pub enum AvifError {
     Size { width: u32, height: u32 },
 }
 
+/// Whether these bytes open an AVIF, by the brands in their `ftyp` box.
+///
+/// Needed because nothing else can answer it. `image` sniffs for a major brand of
+/// `avif` and nothing else, so a file whose major brand is `mif1` — which is what
+/// Convertio writes, and is perfectly legal MIAF, with `avif` sitting in the
+/// compatible brands beside it — comes back unrecognised and falls through to
+/// whatever guess is last in the queue.
+///
+/// So: both lists are searched, major and compatible, which is what the brand
+/// mechanism is for. A container that is ISO media but says nothing about AVIF
+/// (HEIC, plain MP4) is not claimed here — see [`is_iso_media`], which is what
+/// lets the caller say so rather than blame the file for not being an SVG.
+pub fn is_avif(data: &[u8]) -> bool {
+    brands(data).is_some_and(|mut brands| brands.any(|brand| brand == b"avif" || brand == b"avis"))
+}
+
+/// Whether these bytes are an ISO media container of any kind.
+///
+/// True for the AVIF above and equally for HEIC, MP4 and the rest. Only worth
+/// asking after [`is_avif`] has said no, and only to tell the user *that* rather
+/// than let the file be mistaken for something it never resembled.
+pub fn is_iso_media(data: &[u8]) -> bool {
+    brands(data).is_some()
+}
+
+/// The brands in a `ftyp` box: the major one, then the compatible list.
+///
+/// `None` when there is no `ftyp` box at the front, which is every file that is
+/// not ISO media.
+fn brands(data: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
+    if data.len() < 16 || &data[4..8] != b"ftyp" {
+        return None;
+    }
+    // The box says how long it is, and a file can be shorter than it claims.
+    let declared = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let end = declared.clamp(16, data.len());
+
+    // 8..12 is the major brand and 12..16 its minor *version* — a number, not a
+    // brand, and the one four-byte field in here that must not be compared.
+    let major = &data[8..12];
+    let compatible = data[16..end].chunks_exact(4);
+    Some(std::iter::once(major).chain(compatible))
+}
+
 /// Decode an AVIF to straight RGBA.
 ///
 /// Whole-file rather than streaming: the container is a box structure that is
@@ -338,6 +382,62 @@ mod tests {
                 "at (32,{y}) the ramp should be about {expected}, got {got}"
             );
         }
+    }
+
+    /// Build a `ftyp` box, which is the only part of a container these
+    /// questions look at.
+    ///
+    /// Written out rather than pasted as hex: the point of most of these cases
+    /// is *which four bytes sit where*, and that is exactly what a hex blob
+    /// hides.
+    fn ftyp(major: &[u8; 4], minor: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let size = 16 + compatible.len() * 4;
+        let mut out = (size as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(b"ftyp");
+        out.extend_from_slice(major);
+        out.extend_from_slice(minor);
+        for brand in compatible {
+            out.extend_from_slice(*brand);
+        }
+        out
+    }
+
+    #[test]
+    fn a_compatible_brand_is_enough_to_claim_the_file() {
+        // What Convertio writes, and what found this: the major brand is `mif1`
+        // and `avif` appears only in the compatible list. `image` sniffs the
+        // major brand alone, which is why nothing before this saw an AVIF here.
+        let convertio = ftyp(b"mif1", b"    ", &[b"mif1", b"avif", b"miaf"]);
+        assert!(is_avif(&convertio));
+
+        // And the plain case, from the fixtures an encoder actually wrote.
+        assert!(is_avif(OPAQUE));
+        assert!(is_avif(ALPHA));
+    }
+
+    #[test]
+    fn other_containers_are_not_claimed() {
+        // HEIC is ISO media and is not this. Saying so is the difference between
+        // "Imaginer does not open HEIC" and a parse error about some other
+        // format entirely.
+        let heic = ftyp(b"heic", b"    ", &[b"heic", b"mif1"]);
+        assert!(!is_avif(&heic));
+        assert!(is_iso_media(&heic));
+
+        assert!(!is_avif(&[0xFF, 0xD8, 0xFF, 0xE0]), "a JPEG");
+        assert!(!is_iso_media(br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#));
+        assert!(!is_avif(&[]));
+
+        let truncated = ftyp(b"mif1", b"    ", &[b"avif"]);
+        assert!(!is_avif(&truncated[..10]), "truncated names no brand");
+    }
+
+    #[test]
+    fn a_minor_version_is_never_read_as_a_brand() {
+        // Bytes 12..16 are a version number. One that happened to spell `avif`
+        // would claim every ISO media file on the disk if it were compared.
+        let trap = ftyp(b"heic", b"avif", &[b"heic"]);
+        assert!(!is_avif(&trap), "the minor version is not a brand");
     }
 
     #[test]
