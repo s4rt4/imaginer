@@ -33,6 +33,76 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "jxl", "avif",
 ];
 
+/// How much a single decode may allocate, in bytes, before it is refused.
+///
+/// `image` defaults this to 512MiB, which nobody here chose and which a real
+/// photograph reaches: a 16668 x 11117 vector export — 185 megapixels — needs
+/// 530MiB as RGB and was turned away by 18MiB, with "Memory limit exceeded" and
+/// no hint that the number was arbitrary.
+///
+/// 2GiB instead, which covers about 700 megapixels — past any scan or panorama a
+/// person owns — while still refusing the decompression bomb the limit exists
+/// for: a file claiming 65535 x 65535 asks for 12GiB and is still stopped at the
+/// header, before a byte is allocated.
+///
+/// Override with `IMAGINER_MAX_DECODE_MB` for a machine where either number is
+/// wrong.
+const DEFAULT_MAX_DECODE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Turn a decode failure into the most specific thing that can be said about it.
+///
+/// `image` reports a refused allocation as "Memory limit exceeded" and nothing
+/// else — not the size of the picture, not the size of the limit, not that the
+/// limit is a number this program chose and can change. All three are knowable
+/// here: the dimensions come from the header, which costs one more open of a
+/// file that is not going to be decoded anyway.
+fn decode_failure(path: &Path, source: image::ImageError) -> DecodeError {
+    let display = path.display().to_string();
+    if matches!(source, image::ImageError::Limits(_))
+        && let Some((width, height)) = header_dimensions(path)
+    {
+        let pixels = u64::from(width) * u64::from(height);
+        return DecodeError::TooLarge {
+            path: display,
+            width,
+            height,
+            megapixels: pixels as f64 / 1_000_000.0,
+            // Three bytes a pixel: what the decoder reserves for the picture
+            // itself, which is the allocation the limit actually refused.
+            needed_mb: pixels * 3 / (1024 * 1024),
+            limit_mb: max_decode_bytes() / (1024 * 1024),
+        };
+    }
+
+    DecodeError::Image {
+        path: display,
+        source,
+    }
+}
+
+/// The size in the file's own header, read without decoding it.
+fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+fn max_decode_bytes() -> u64 {
+    std::env::var("IMAGINER_MAX_DECODE_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_MAX_DECODE, |mb| mb.saturating_mul(1024 * 1024))
+}
+
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(max_decode_bytes());
+    limits
+}
+
 /// Whether `path` looks like something this build can open.
 ///
 /// Extension-based on purpose: this is used to filter directory listings, where
@@ -72,6 +142,17 @@ pub enum DecodeError {
         path: String,
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error(
+        "{path} is {width} × {height} ({megapixels:.0} megapixels), which needs about {needed_mb}MB to decode — more than the {limit_mb}MB limit. Raise it with IMAGINER_MAX_DECODE_MB."
+    )]
+    TooLarge {
+        path: String,
+        width: u32,
+        height: u32,
+        megapixels: f64,
+        needed_mb: u64,
+        limit_mb: u64,
     },
     #[error("could not decode {path}: {source}")]
     Avif {
@@ -372,10 +453,6 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
         path: path.display().to_string(),
         source,
     };
-    let img_err = |source| DecodeError::Image {
-        path: path.display().to_string(),
-        source,
-    };
     let svg_err = |source| DecodeError::Svg {
         path: path.display().to_string(),
         source,
@@ -391,9 +468,10 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
 
     // Detect by content rather than extension, so a mislabelled `.png` that is
     // really a JPEG still opens.
-    let probe = image::ImageReader::new(reader)
+    let mut probe = image::ImageReader::new(reader)
         .with_guessed_format()
         .map_err(io_err)?;
+    probe.limits(decode_limits());
 
     // The two animated formats take a different road from here: their decoder has
     // to be driven frame by frame, and the generic `decode()` below would throw the
@@ -427,7 +505,7 @@ fn decode_impl(path: &Path, want_animation: bool) -> Result<Decoded, DecodeError
     }
 
     let img = match probe.format() {
-        Some(_) => probe.decode().map_err(img_err)?,
+        Some(_) => probe.decode().map_err(|err| decode_failure(path, err))?,
         // Nothing with a magic number. SVG is the only format here that has none â€”
         // it is XML, and text has nothing to sniff for â€” so it belongs at the end
         // as the fallback rather than as another guess in the queue. A file that is
@@ -811,6 +889,36 @@ fn decode_psd<R: std::io::Read>(
 }
 #[cfg(test)]
 mod tests {
+    /// The number a real photograph tripped over.
+    ///
+    /// A 16668 x 11117 vector export needs 530MiB as RGB and was refused by
+    /// `image`'s 512MiB default — by 18MiB, with a message that named neither
+    /// number. This pins the replacement to something that comfortably clears
+    /// it, since the whole point of the constant is that it is a choice.
+    #[test]
+    fn the_decode_budget_clears_a_185_megapixel_photograph() {
+        let needed = 16668u64 * 11117 * 3;
+        assert!(
+            DEFAULT_MAX_DECODE > needed,
+            "{needed} bytes is what the file that prompted this needs"
+        );
+        // And still refuses what the limit is actually for: the largest picture
+        // a JPEG header can describe, which no one has and which allocates 12GiB.
+        let bomb = 65535u64 * 65535 * 3;
+        assert!(DEFAULT_MAX_DECODE < bomb);
+    }
+
+    #[test]
+    fn the_budget_can_be_overridden_for_a_machine_where_it_is_wrong() {
+        // Serial with the default, because both read the same environment.
+        unsafe { std::env::set_var("IMAGINER_MAX_DECODE_MB", "64") };
+        assert_eq!(max_decode_bytes(), 64 * 1024 * 1024);
+        assert_eq!(decode_limits().max_alloc, Some(64 * 1024 * 1024));
+
+        unsafe { std::env::remove_var("IMAGINER_MAX_DECODE_MB") };
+        assert_eq!(max_decode_bytes(), DEFAULT_MAX_DECODE);
+    }
+
     use super::*;
     use std::io::Write;
 
