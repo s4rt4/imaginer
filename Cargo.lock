@@ -1393,7 +1393,7 @@ checksum = "09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c"
 
 [[package]]
 name = "imaginer-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "gamut-avif",
  "gamut-core",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "imaginer-ui"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "arboard",
  "eframe",

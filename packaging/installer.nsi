@@ -14,7 +14,7 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 
 !define PRODUCT "Imaginer"
-!define VERSION "0.2.3"
+!define VERSION "0.2.4"
 !define EXE "imaginer.exe"
 !define UNKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT}"
 !define PROGID "Imaginer.AssocFile"
@@ -51,6 +51,50 @@ SetCompressor /SOLID lzma
 
 !macro UnregisterExtension ext
   DeleteRegValue HKLM "Software\Classes\${ext}\OpenWithProgids" "${PROGID}"
+!macroend
+
+; The "Convert with Imaginer" submenu, which until 0.2.4 only ever existed on the
+; machine that built the app: `scripts\install-shell-integration.ps1` writes it
+; under HKCU and points it at `target\release\imaginer.exe`, so it was a
+; developer convenience that died with a `cargo clean` and travelled nowhere. The
+; same verbs are written here instead, under HKLM and pointing at $INSTDIR, which
+; puts them on every account of every machine that runs the installer.
+;
+; HKCU\Software\Classes wins over HKLM\Software\Classes in the merged view, so a
+; leftover entry from that script shadows this one and keeps pointing at a build
+; folder. Run the script with -Uninstall once and the installed menu takes over.
+;
+; Structure, format list and quality are the script's: a parent verb whose empty
+; `SubCommands` value makes Explorer enumerate the nested `shell` key, one entry
+; per output format, ordered by key name, converting at the CLI's default quality
+; because a context menu has no room for a slider. `--collect` is what turns a
+; multi-file selection — one process per file, as classic verbs are invoked —
+; back into a single batch that asks once where to put the results.
+!define CONVERT "Imaginer.Convert"
+!define FILETYPES "Software\Classes\SystemFileAssociations"
+
+!macro ConvertTarget ext order format label
+  WriteRegStr HKLM "${FILETYPES}\${ext}\shell\${CONVERT}\shell\${order}_${format}" "MUIVerb" "${label}"
+  WriteRegStr HKLM "${FILETYPES}\${ext}\shell\${CONVERT}\shell\${order}_${format}\command" "" '"$INSTDIR\${EXE}" --convert ${format} --collect "%1"'
+!macroend
+
+!macro RegisterConvert ext
+  ; Written fresh rather than merged into: an older install's format list comes
+  ; out with the key, instead of lingering as an entry nothing writes any more.
+  DeleteRegKey HKLM "${FILETYPES}\${ext}\shell\${CONVERT}"
+  WriteRegStr HKLM "${FILETYPES}\${ext}\shell\${CONVERT}" "MUIVerb" "Convert with ${PRODUCT}"
+  ; Empty, not absent: this is the signal to look for sub-verbs in the nested
+  ; `shell` key. Remove it and the submenu collapses into a dead entry.
+  WriteRegStr HKLM "${FILETYPES}\${ext}\shell\${CONVERT}" "SubCommands" ""
+  WriteRegStr HKLM "${FILETYPES}\${ext}\shell\${CONVERT}" "Icon" "$INSTDIR\${EXE},0"
+  !insertmacro ConvertTarget "${ext}" "01" "webp" "WebP"
+  !insertmacro ConvertTarget "${ext}" "02" "ico" "Icon (.ico)"
+  !insertmacro ConvertTarget "${ext}" "03" "png" "PNG"
+  !insertmacro ConvertTarget "${ext}" "04" "jpg" "JPEG"
+!macroend
+
+!macro UnregisterConvert ext
+  DeleteRegKey HKLM "${FILETYPES}\${ext}\shell\${CONVERT}"
 !macroend
 
 !define MUI_ICON "imaginer.ico"
@@ -157,6 +201,7 @@ Section "Install"
   WriteRegStr HKLM "Software\RegisteredApplications" "${PRODUCT}" "${CAPS}"
 
   !insertmacro EachExtension RegisterExtension
+  !insertmacro EachExtension RegisterConvert
 
   ; Tell the shell the association list changed, so the menu is right without a
   ; sign-out.
@@ -184,6 +229,7 @@ Section "un.Install"
   ; the per-extension names, which would otherwise leave a dead Imaginer in the
   ; Open-with menu of every image on the machine.
   !insertmacro EachExtension UnregisterExtension
+  !insertmacro EachExtension UnregisterConvert
   DeleteRegKey HKLM "Software\Classes\${PROGID}"
   DeleteRegKey HKLM "${APPKEY}"
   DeleteRegValue HKLM "Software\RegisteredApplications" "${PRODUCT}"

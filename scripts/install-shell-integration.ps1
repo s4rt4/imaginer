@@ -16,6 +16,12 @@
     HKLM\...\Explorer\CommandStore, which would need administrator rights for no
     gain here.
 
+    Since 0.2.4 the installer writes the same submenu under HKLM, pointing at the
+    installed exe, so an ordinary install already has it on every account. This
+    script stays for pointing the menu at a development build instead: HKCU wins
+    over HKLM in the merged view, so what it writes shadows the installed entries
+    until -Uninstall takes it back out.
+
     Each entry passes a single file, because that is all a classic verb gets:
     selecting twelve images launches twelve processes. `--collect` is what puts them
     back together — the first process to start collects the others' paths over a

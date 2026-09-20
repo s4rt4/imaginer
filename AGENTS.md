@@ -209,6 +209,13 @@ version shown in the settings panel and in the exe's version resource.
   upgrade over a running viewer does not fail.
 - `VERSION` in `installer.nsi` is hand-copied from the workspace version —
   bumping `Cargo.toml` means editing it too.
+- **The Convert submenu is the installer's job since 0.2.4** — the same verbs
+  `install-shell-integration.ps1` writes under HKCU now go under
+  `HKLM\Software\Classes\SystemFileAssociations\<ext>\shell\Imaginer.Convert`,
+  pointing at `$INSTDIR`. HKCU shadows HKLM in the merged view, so a dev
+  registration still wins until `-Uninstall` removes it; the script is for
+  pointing the menu at a build folder, nothing else. Verified by installing,
+  uninstalling (all 14 keys come out) and reinstalling.
 - winresource gotcha: `WindowsResource::set()` adds the NUL itself; passing
   `concat!(..., "\0")` puts a literal NUL in the .rc and rc.exe dies with a
   misleading `RC2104` on the *next* line.
